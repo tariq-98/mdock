@@ -1,0 +1,18 @@
+# Jellyfin on mdock with the Mac's media engine (VideoToolbox) doing decode/encode.
+#   docker build -t mdock/jellyfin:10.11.11 .        (once; patched official image)
+#   docker compose up -d                              then http://localhost:8096
+# Then in Dashboard > Playback > Transcoding, select "Apple VideoToolbox".
+#
+# Media, config and cache must be bind mounts from macOS (anywhere under /Users or /Volumes):
+# ffmpeg runs on the Mac and needs to see the same files. Named volumes would not work.
+services:
+  jellyfin:
+    image: mdock/jellyfin:10.11.11
+    restart: unless-stopped
+    ports: ["8096:8096"]
+    devices:
+      - mdock.dev/media=ffmpeg       # ffmpeg/ffprobe run on the Mac through the mdock bridge
+    volumes:
+      - ${HOME}/mdock/jellyfin/config:/config
+      - ${HOME}/mdock/jellyfin/cache:/cache
+      - ${HOME}/Movies:/media/movies:ro

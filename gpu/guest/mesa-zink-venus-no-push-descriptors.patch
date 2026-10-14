@@ -1,0 +1,17 @@
+diff -ruN a/src/gallium/drivers/zink/zink_screen.c b/src/gallium/drivers/zink/zink_screen.c
+--- a/src/gallium/drivers/zink/zink_screen.c	2026-10-14 19:42:55
++++ b/src/gallium/drivers/zink/zink_screen.c	2026-10-14 19:42:59
+@@ -2997,6 +2997,13 @@
+    }
+ 
+    switch (zink_driverid(screen)) {
++   case VK_DRIVER_ID_MESA_VENUS:
++      /* mdock: Venus on a Mac runs on MoltenVK, which can only alias a binding (Zink reads one UBO
++       * as both 32- and 64-bit, e.g. OpenCL kernel arguments) through Metal argument buffers, and
++       * push descriptor sets never use those: pipeline creation failed. */
++      if (strstr(screen->info.props.deviceName, "Apple"))
++         screen->info.have_KHR_push_descriptor = false;
++      break;
+    case VK_DRIVER_ID_MESA_RADV:
+    case VK_DRIVER_ID_AMD_OPEN_SOURCE:
+    case VK_DRIVER_ID_AMD_PROPRIETARY:

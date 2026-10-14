@@ -1,0 +1,134 @@
+From 47d48798b891f67b109323a65894a00b4bf90f84 Mon Sep 17 00:00:00 2001
+From: Hector Martin <marcan@marcan.st>
+Date: Thu, 11 Apr 2024 09:51:22 +0900
+Subject: [PATCH 16/30] arm64: Introduce scaffolding to add ACTLR_EL1 to thread
+ state
+
+Some CPUs expose IMPDEF features in ACTLR_EL1 that can be meaningfully
+controlled per-thread (like TSO control on Apple cores). Add the basic
+scaffolding to save/restore this register as part of context switching.
+
+This mechanism is disabled by default both by config symbol and via a
+runtime check, which ensures it is never triggered unless the system is
+known to need it for some feature (which also implies that the layout of
+ACTLR_EL1 is uniform between all CPU core types).
+
+Signed-off-by: Hector Martin <marcan@marcan.st>
+Reviewed-by: Neal Gompa <neal@gompa.dev>
+---
+diff --git a/arch/arm64/Kconfig b/arch/arm64/Kconfig
+index 46282afbe..e159ff6a0 100644
+--- a/arch/arm64/Kconfig
++++ b/arch/arm64/Kconfig
+@@ -443,6 +443,9 @@ config KASAN_SHADOW_OFFSET
+ config UNWIND_TABLES
+ 	bool
+ 
++config ARM64_ACTLR_STATE
++	bool
++
+ source "arch/arm64/Kconfig.platforms"
+ 
+ menu "Kernel Features"
+diff --git a/arch/arm64/include/asm/cpufeature.h b/arch/arm64/include/asm/cpufeature.h
+index 629d38196..b03f32668 100644
+--- a/arch/arm64/include/asm/cpufeature.h
++++ b/arch/arm64/include/asm/cpufeature.h
+@@ -955,6 +955,11 @@ static inline unsigned int get_vmid_bits(u64 mmfr1)
+ 	return 8;
+ }
+ 
++static __always_inline bool system_has_actlr_state(void)
++{
++	return false;
++}
++
+ s64 arm64_ftr_safe_value(const struct arm64_ftr_bits *ftrp, s64 new, s64 cur);
+ struct arm64_ftr_reg *get_arm64_ftr_reg(u32 sys_id);
+ 
+diff --git a/arch/arm64/include/asm/processor.h b/arch/arm64/include/asm/processor.h
+index ba0517d80..5b4daa009 100644
+--- a/arch/arm64/include/asm/processor.h
++++ b/arch/arm64/include/asm/processor.h
+@@ -187,6 +187,9 @@ struct thread_struct {
+ 	u64			svcr;
+ 	u64			tpidr2_el0;
+ 	u64			por_el0;
++#ifdef CONFIG_ARM64_ACTLR_STATE
++	u64			actlr;
++#endif
+ #ifdef CONFIG_ARM64_GCS
+ 	unsigned int		gcs_el0_mode;
+ 	unsigned int		gcs_el0_locked;
+diff --git a/arch/arm64/kernel/process.c b/arch/arm64/kernel/process.c
+index bc643372f..66ad8d2a1 100644
+--- a/arch/arm64/kernel/process.c
++++ b/arch/arm64/kernel/process.c
+@@ -479,6 +479,11 @@ int copy_thread(struct task_struct *p, const struct kernel_clone_args *args)
+ 		if (system_supports_poe())
+ 			p->thread.por_el0 = read_sysreg_s(SYS_POR_EL0);
+ 
++#ifdef CONFIG_ARM64_ACTLR_STATE
++		if (system_has_actlr_state())
++			p->thread.actlr = read_sysreg(actlr_el1);
++#endif
++
+ 		if (stack_start) {
+ 			if (is_compat_thread(task_thread_info(p)))
+ 				childregs->compat_sp = stack_start;
+@@ -755,6 +760,25 @@ int arch_prctl_mem_model_set(struct task_struct *t, unsigned long val)
+ }
+ #endif
+ 
++#ifdef CONFIG_ARM64_ACTLR_STATE
++/*
++ * IMPDEF control register ACTLR_EL1 handling. Some CPUs use this to
++ * expose features that can be controlled by userspace.
++ */
++static void actlr_thread_switch(struct task_struct *next)
++{
++	if (!system_has_actlr_state())
++		return;
++
++	current->thread.actlr = read_sysreg(actlr_el1);
++	write_sysreg(next->thread.actlr, actlr_el1);
++}
++#else
++static inline void actlr_thread_switch(struct task_struct *next)
++{
++}
++#endif
++
+ /*
+  * Thread switching.
+  */
+@@ -773,6 +797,7 @@ struct task_struct *__switch_to(struct task_struct *prev,
+ 	cntkctl_thread_switch(prev, next);
+ 	ptrauth_thread_switch_user(next);
+ 	permission_overlay_switch(next);
++	actlr_thread_switch(next);
+ 	gcs_thread_switch(next);
+ 
+ 	/*
+diff --git a/arch/arm64/kernel/setup.c b/arch/arm64/kernel/setup.c
+index 23c05dc7a..205ff6aad 100644
+--- a/arch/arm64/kernel/setup.c
++++ b/arch/arm64/kernel/setup.c
+@@ -369,6 +369,15 @@ void __init __no_sanitize_address setup_arch(char **cmdline_p)
+ 	init_task.thread_info.ttbr0 = phys_to_ttbr(__pa_symbol(reserved_pg_dir));
+ #endif
+ 
++#ifdef CONFIG_ARM64_ACTLR_STATE
++	/* Store the boot CPU ACTLR_EL1 value as the default. This will only
++	 * be actually restored during context switching iff the platform is
++	 * known to use ACTLR_EL1 for exposable features and its layout is
++	 * known to be the same on all CPUs.
++	 */
++	init_task.thread.actlr = read_sysreg(actlr_el1);
++#endif
++
+ 	if (boot_args[1] || boot_args[2] || boot_args[3]) {
+ 		pr_err("WARNING: x1-x3 nonzero in violation of boot protocol:\n"
+ 			"\tx1: %016llx\n\tx2: %016llx\n\tx3: %016llx\n"
+-- 
+2.43.0

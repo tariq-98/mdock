@@ -1,0 +1,169 @@
+diff -ruN a/src/devices/src/virtio/balloon/device.rs b/src/devices/src/virtio/balloon/device.rs
+--- a/src/devices/src/virtio/balloon/device.rs	2026-09-29 10:14:22
++++ b/src/devices/src/virtio/balloon/device.rs	2026-10-14 18:38:44
+@@ -2,7 +2,11 @@
+ use std::convert::TryInto;
+ use std::io::Write;
+ 
++#[cfg(target_os = "macos")]
++use crossbeam_channel::{unbounded, Sender};
+ use utils::eventfd::EventFd;
++#[cfg(target_os = "macos")]
++use utils::worker_message::WorkerMessage;
+ use vm_memory::{ByteValued, GuestMemory, GuestMemoryMmap};
+ 
+ use super::super::{
+@@ -52,6 +56,8 @@
+     pub(crate) activate_evt: EventFd,
+     pub(crate) device_state: DeviceState,
+     config: VirtioBalloonConfig,
++    #[cfg(target_os = "macos")]
++    map_sender: Option<Sender<WorkerMessage>>,
+ }
+ 
+ impl Balloon {
+@@ -64,9 +70,17 @@
+                 .map_err(BalloonError::EventFd)?,
+             device_state: DeviceState::Inactive,
+             config: VirtioBalloonConfig::default(),
++            #[cfg(target_os = "macos")]
++            map_sender: None,
+         })
+     }
+ 
++    /// mdock: free page reports go to the VMM, which can return the memory to macOS for real.
++    #[cfg(target_os = "macos")]
++    pub fn set_map_sender(&mut self, map_sender: Sender<WorkerMessage>) {
++        self.map_sender = Some(map_sender);
++    }
++
+     pub fn id(&self) -> &str {
+         defs::BALLOON_DEV_ID
+     }
+@@ -93,6 +107,22 @@
+                     "balloon: should release guest_addr={:?} host_addr={:p} len={}",
+                     desc.addr, host_addr, desc.len
+                 );
++                #[cfg(target_os = "macos")]
++                if let Some(sender) = &self.map_sender {
++                    let (reply_sender, reply_receiver) = unbounded();
++                    if sender
++                        .send(WorkerMessage::ReleaseMemory(
++                            reply_sender,
++                            host_addr as u64,
++                            desc.addr.0,
++                            desc.len as u64,
++                        ))
++                        .is_ok()
++                        && reply_receiver.recv().unwrap_or(false)
++                    {
++                        continue;
++                    }
++                }
+                 #[cfg(target_os = "linux")]
+                 let advice = libc::MADV_DONTNEED;
+                 #[cfg(target_os = "macos")]
+diff -ruN a/src/utils/src/worker_message.rs b/src/utils/src/worker_message.rs
+--- a/src/utils/src/worker_message.rs	2026-09-29 10:14:22
++++ b/src/utils/src/worker_message.rs	2026-10-14 18:38:44
+@@ -18,5 +18,8 @@
+     GpuAddMapping(crossbeam_channel::Sender<bool>, u64, u64, u64),
+     #[cfg(target_os = "macos")]
+     GpuRemoveMapping(crossbeam_channel::Sender<bool>, u64, u64),
++    /// Free page reporting: give the host pages behind (host_addr, guest_addr, len) back to macOS.
++    #[cfg(target_os = "macos")]
++    ReleaseMemory(crossbeam_channel::Sender<bool>, u64, u64, u64),
+     ConvertMemory(crossbeam_channel::Sender<bool>, MemoryProperties),
+ }
+diff -ruN a/src/vmm/src/builder.rs b/src/vmm/src/builder.rs
+--- a/src/vmm/src/builder.rs	2026-09-29 10:14:22
++++ b/src/vmm/src/builder.rs	2026-10-14 18:38:44
+@@ -978,7 +978,13 @@
+     }
+ 
+     #[cfg(not(feature = "tee"))]
+-    attach_balloon_device(&mut vmm, event_manager, intc.clone())?;
++    attach_balloon_device(
++        &mut vmm,
++        event_manager,
++        intc.clone(),
++        #[cfg(target_os = "macos")]
++        _sender.clone(),
++    )?;
+     #[cfg(not(feature = "tee"))]
+     attach_rng_device(&mut vmm, event_manager, intc.clone())?;
+     let mut console_id = 0;
+@@ -2212,10 +2218,13 @@
+     vmm: &mut Vmm,
+     event_manager: &mut EventManager,
+     intc: IrqChip,
++    #[cfg(target_os = "macos")] map_sender: Sender<WorkerMessage>,
+ ) -> std::result::Result<(), StartMicrovmError> {
+     use self::StartMicrovmError::*;
+ 
+     let balloon = Arc::new(Mutex::new(devices::virtio::Balloon::new().unwrap()));
++    #[cfg(target_os = "macos")]
++    balloon.lock().unwrap().set_map_sender(map_sender);
+ 
+     event_manager
+         .add_subscriber(balloon.clone())
+diff -ruN a/src/vmm/src/lib.rs b/src/vmm/src/lib.rs
+--- a/src/vmm/src/lib.rs	2026-09-29 10:14:22
++++ b/src/vmm/src/lib.rs	2026-10-14 18:38:44
+@@ -394,6 +394,11 @@
+     pub fn remove_mapping(&self, reply_sender: Sender<bool>, guest_addr: u64, len: u64) {
+         self.vm.remove_mapping(reply_sender, guest_addr, len);
+     }
++
++    #[cfg(target_os = "macos")]
++    pub fn release_memory(&self, reply_sender: Sender<bool>, host_addr: u64, guest_addr: u64, len: u64) {
++        self.vm.release_memory(reply_sender, host_addr, guest_addr, len);
++    }
+ }
+ 
+ impl Subscriber for Vmm {
+diff -ruN a/src/vmm/src/macos/vstate.rs b/src/vmm/src/macos/vstate.rs
+--- a/src/vmm/src/macos/vstate.rs	2026-09-29 10:14:22
++++ b/src/vmm/src/macos/vstate.rs	2026-10-14 18:38:44
+@@ -150,6 +150,29 @@
+         }
+     }
+ 
++    /// mdock: returns a range the guest reported free to macOS. madvise() can't reclaim pages the
++    /// guest wrote while they are mapped into the VM (it is silently a no-op), and MADV_FREE leaves
++    /// them on the process's footprint, so: take the range out of the VM, mark it reusable (macOS
++    /// reclaims it and stops charging it to this process), and map it back. The guest isn't using
++    /// it (reported pages stay isolated until the report completes), and its next touch gets fresh
++    /// zero pages.
++    pub fn release_memory(&self, reply_sender: Sender<bool>, host_addr: u64, guest_addr: u64, len: u64) {
++        if let Err(e) = self.hvf_vm.unmap_memory(guest_addr, len) {
++            debug!("release_memory: unmap {guest_addr:x}+{len:x}: {e:?}");
++            reply_sender.send(false).unwrap();
++            return;
++        }
++        unsafe {
++            libc::madvise(host_addr as *mut libc::c_void, len as usize, libc::MADV_FREE_REUSABLE);
++        }
++        // The range must go back into the VM whatever happened above.
++        let mapped = self.hvf_vm.map_memory(host_addr, guest_addr, len);
++        if let Err(e) = &mapped {
++            error!("release_memory: remap {guest_addr:x}+{len:x} failed: {e:?}");
++        }
++        reply_sender.send(mapped.is_ok()).unwrap();
++    }
++
+     pub fn remove_mapping(&self, reply_sender: Sender<bool>, guest_addr: u64, len: u64) {
+         debug!("remove_mapping: guest_addr={guest_addr:x}, len={len}");
+         if let Err(e) = self.hvf_vm.unmap_memory(guest_addr, len) {
+diff -ruN a/src/vmm/src/worker.rs b/src/vmm/src/worker.rs
+--- a/src/vmm/src/worker.rs	2026-09-29 10:14:22
++++ b/src/vmm/src/worker.rs	2026-10-14 18:38:44
+@@ -44,6 +44,8 @@
+             WorkerMessage::GpuAddMapping(s, h, g, l) => self.add_mapping(s, h, g, l),
+             #[cfg(target_os = "macos")]
+             WorkerMessage::GpuRemoveMapping(s, g, l) => self.remove_mapping(s, g, l),
++            #[cfg(target_os = "macos")]
++            WorkerMessage::ReleaseMemory(s, h, g, l) => self.release_memory(s, h, g, l),
+             #[cfg(target_arch = "x86_64")]
+             WorkerMessage::GsiRoute(sender, entries) => {
+                 let mut routing = kvm_bindings::KvmIrqRouting::new(entries.len()).unwrap();

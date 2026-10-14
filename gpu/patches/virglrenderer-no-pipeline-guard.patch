@@ -1,0 +1,190 @@
+diff -ruN a/src/venus/vkr_command_buffer.c b/src/venus/vkr_command_buffer.c
+--- a/src/venus/vkr_command_buffer.c	2025-10-28 10:45:33
++++ b/src/venus/vkr_command_buffer.c	2026-10-14 19:42:09
+@@ -21,6 +21,26 @@
+       _vk->cmd_name(args->commandBuffer, ##__VA_ARGS__);                                 \
+    } while (0)
+ 
++/* mdock: as VKR_CMD_CALL, but drops the command unless a pipeline is bound at the given bind point
++ * (see struct vkr_command_buffer). */
++#define VKR_CMD_CALL_BOUND(bound, cmd_name, args, ...)                                   \
++   do {                                                                                  \
++      struct vkr_command_buffer *_cmd =                                                  \
++         vkr_command_buffer_from_handle(args->commandBuffer);                            \
++      if (!_cmd->bound) {                                                                \
++         static bool _logged;                                                            \
++         if (!_logged) {                                                                 \
++            _logged = true;                                                              \
++            vkr_log("dropping vk" #cmd_name " recorded with no pipeline bound");         \
++         }                                                                               \
++         return;                                                                         \
++      }                                                                                  \
++      struct vn_device_proc_table *_vk = &_cmd->device->proc_table;                      \
++                                                                                         \
++      vn_replace_vk##cmd_name##_args_handle(args);                                       \
++      _vk->cmd_name(args->commandBuffer, ##__VA_ARGS__);                                 \
++   } while (0)
++
+ static void
+ vkr_dispatch_vkCreateCommandPool(struct vn_dispatch_context *dispatch,
+                                  struct vn_command_vkCreateCommandPool *args)
+@@ -113,6 +133,7 @@
+    struct vkr_command_buffer *cmd = vkr_command_buffer_from_handle(args->commandBuffer);
+    struct vn_device_proc_table *vk = &cmd->device->proc_table;
+ 
++   cmd->graphics_pipeline_bound = cmd->compute_pipeline_bound = false;
+    vn_replace_vkResetCommandBuffer_args_handle(args);
+    args->ret = vk->ResetCommandBuffer(args->commandBuffer, args->flags);
+ }
+@@ -124,6 +145,7 @@
+    struct vkr_command_buffer *cmd = vkr_command_buffer_from_handle(args->commandBuffer);
+    struct vn_device_proc_table *vk = &cmd->device->proc_table;
+ 
++   cmd->graphics_pipeline_bound = cmd->compute_pipeline_bound = false;
+    vn_replace_vkBeginCommandBuffer_args_handle(args);
+    args->ret = vk->BeginCommandBuffer(args->commandBuffer, args->pBeginInfo);
+ }
+@@ -143,7 +165,18 @@
+ vkr_dispatch_vkCmdBindPipeline(UNUSED struct vn_dispatch_context *dispatch,
+                                struct vn_command_vkCmdBindPipeline *args)
+ {
+-   VKR_CMD_CALL(CmdBindPipeline, args, args->pipelineBindPoint, args->pipeline);
++   struct vkr_command_buffer *cmd = vkr_command_buffer_from_handle(args->commandBuffer);
++   struct vn_device_proc_table *vk = &cmd->device->proc_table;
++
++   vn_replace_vkCmdBindPipeline_args_handle(args);
++   /* mdock: a null pipeline (the guest's creation failed) is not bound; see VKR_CMD_CALL_BOUND. */
++   if (args->pipeline == VK_NULL_HANDLE)
++      return;
++   vk->CmdBindPipeline(args->commandBuffer, args->pipelineBindPoint, args->pipeline);
++   if (args->pipelineBindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS)
++      cmd->graphics_pipeline_bound = true;
++   else if (args->pipelineBindPoint == VK_PIPELINE_BIND_POINT_COMPUTE)
++      cmd->compute_pipeline_bound = true;
+ }
+ 
+ static void
+@@ -240,7 +273,7 @@
+ vkr_dispatch_vkCmdDraw(UNUSED struct vn_dispatch_context *dispatch,
+                        struct vn_command_vkCmdDraw *args)
+ {
+-   VKR_CMD_CALL(CmdDraw, args, args->vertexCount, args->instanceCount, args->firstVertex,
++   VKR_CMD_CALL_BOUND(graphics_pipeline_bound, CmdDraw, args, args->vertexCount, args->instanceCount, args->firstVertex,
+                 args->firstInstance);
+ }
+ 
+@@ -248,7 +281,7 @@
+ vkr_dispatch_vkCmdDrawIndexed(UNUSED struct vn_dispatch_context *dispatch,
+                               struct vn_command_vkCmdDrawIndexed *args)
+ {
+-   VKR_CMD_CALL(CmdDrawIndexed, args, args->indexCount, args->instanceCount,
++   VKR_CMD_CALL_BOUND(graphics_pipeline_bound, CmdDrawIndexed, args, args->indexCount, args->instanceCount,
+                 args->firstIndex, args->vertexOffset, args->firstInstance);
+ }
+ 
+@@ -256,7 +289,7 @@
+ vkr_dispatch_vkCmdDrawIndirect(UNUSED struct vn_dispatch_context *dispatch,
+                                struct vn_command_vkCmdDrawIndirect *args)
+ {
+-   VKR_CMD_CALL(CmdDrawIndirect, args, args->buffer, args->offset, args->drawCount,
++   VKR_CMD_CALL_BOUND(graphics_pipeline_bound, CmdDrawIndirect, args, args->buffer, args->offset, args->drawCount,
+                 args->stride);
+ }
+ 
+@@ -264,7 +297,7 @@
+ vkr_dispatch_vkCmdDrawIndexedIndirect(UNUSED struct vn_dispatch_context *dispatch,
+                                       struct vn_command_vkCmdDrawIndexedIndirect *args)
+ {
+-   VKR_CMD_CALL(CmdDrawIndexedIndirect, args, args->buffer, args->offset, args->drawCount,
++   VKR_CMD_CALL_BOUND(graphics_pipeline_bound, CmdDrawIndexedIndirect, args, args->buffer, args->offset, args->drawCount,
+                 args->stride);
+ }
+ 
+@@ -272,7 +305,7 @@
+ vkr_dispatch_vkCmdDispatch(UNUSED struct vn_dispatch_context *dispatch,
+                            struct vn_command_vkCmdDispatch *args)
+ {
+-   VKR_CMD_CALL(CmdDispatch, args, args->groupCountX, args->groupCountY,
++   VKR_CMD_CALL_BOUND(compute_pipeline_bound, CmdDispatch, args, args->groupCountX, args->groupCountY,
+                 args->groupCountZ);
+ }
+ 
+@@ -280,7 +313,7 @@
+ vkr_dispatch_vkCmdDispatchIndirect(UNUSED struct vn_dispatch_context *dispatch,
+                                    struct vn_command_vkCmdDispatchIndirect *args)
+ {
+-   VKR_CMD_CALL(CmdDispatchIndirect, args, args->buffer, args->offset);
++   VKR_CMD_CALL_BOUND(compute_pipeline_bound, CmdDispatchIndirect, args, args->buffer, args->offset);
+ }
+ 
+ static void
+@@ -535,7 +568,7 @@
+ vkr_dispatch_vkCmdDispatchBase(UNUSED struct vn_dispatch_context *dispatch,
+                                struct vn_command_vkCmdDispatchBase *args)
+ {
+-   VKR_CMD_CALL(CmdDispatchBase, args, args->baseGroupX, args->baseGroupY,
++   VKR_CMD_CALL_BOUND(compute_pipeline_bound, CmdDispatchBase, args, args->baseGroupX, args->baseGroupY,
+                 args->baseGroupZ, args->groupCountX, args->groupCountY,
+                 args->groupCountZ);
+ }
+@@ -566,7 +599,7 @@
+ vkr_dispatch_vkCmdDrawIndirectCount(UNUSED struct vn_dispatch_context *dispatch,
+                                     struct vn_command_vkCmdDrawIndirectCount *args)
+ {
+-   VKR_CMD_CALL(CmdDrawIndirectCount, args, args->buffer, args->offset, args->countBuffer,
++   VKR_CMD_CALL_BOUND(graphics_pipeline_bound, CmdDrawIndirectCount, args, args->buffer, args->offset, args->countBuffer,
+                 args->countBufferOffset, args->maxDrawCount, args->stride);
+ }
+ 
+@@ -575,7 +608,7 @@
+    UNUSED struct vn_dispatch_context *dispatch,
+    struct vn_command_vkCmdDrawIndexedIndirectCount *args)
+ {
+-   VKR_CMD_CALL(CmdDrawIndexedIndirectCount, args, args->buffer, args->offset,
++   VKR_CMD_CALL_BOUND(graphics_pipeline_bound, CmdDrawIndexedIndirectCount, args, args->buffer, args->offset,
+                 args->countBuffer, args->countBufferOffset, args->maxDrawCount,
+                 args->stride);
+ }
+@@ -637,7 +670,7 @@
+    UNUSED struct vn_dispatch_context *dispatch,
+    struct vn_command_vkCmdDrawIndirectByteCountEXT *args)
+ {
+-   VKR_CMD_CALL(CmdDrawIndirectByteCountEXT, args, args->instanceCount,
++   VKR_CMD_CALL_BOUND(graphics_pipeline_bound, CmdDrawIndirectByteCountEXT, args, args->instanceCount,
+                 args->firstInstance, args->counterBuffer, args->counterBufferOffset,
+                 args->counterOffset, args->vertexStride);
+ }
+@@ -837,7 +870,7 @@
+ vkr_dispatch_vkCmdDrawMultiEXT(UNUSED struct vn_dispatch_context *dispatch,
+                                struct vn_command_vkCmdDrawMultiEXT *args)
+ {
+-   VKR_CMD_CALL(CmdDrawMultiEXT, args, args->drawCount, args->pVertexInfo,
++   VKR_CMD_CALL_BOUND(graphics_pipeline_bound, CmdDrawMultiEXT, args, args->drawCount, args->pVertexInfo,
+                 args->instanceCount, args->firstInstance, args->stride);
+ }
+ 
+@@ -845,7 +878,7 @@
+ vkr_dispatch_vkCmdDrawMultiIndexedEXT(UNUSED struct vn_dispatch_context *dispatch,
+                                       struct vn_command_vkCmdDrawMultiIndexedEXT *args)
+ {
+-   VKR_CMD_CALL(CmdDrawMultiIndexedEXT, args, args->drawCount, args->pIndexInfo,
++   VKR_CMD_CALL_BOUND(graphics_pipeline_bound, CmdDrawMultiIndexedEXT, args, args->drawCount, args->pIndexInfo,
+                 args->instanceCount, args->firstInstance, args->stride,
+                 args->pVertexOffset);
+ }
+diff -ruN a/src/venus/vkr_command_buffer.h b/src/venus/vkr_command_buffer.h
+--- a/src/venus/vkr_command_buffer.h	2025-10-28 10:45:33
++++ b/src/venus/vkr_command_buffer.h	2026-10-14 19:42:09
+@@ -21,6 +21,12 @@
+    struct vkr_object base;
+ 
+    struct vkr_device *device;
++
++   /* mdock: whether a pipeline is bound at each bind point. MoltenVK dereferences the bound
++    * pipeline when it encodes a draw or dispatch, so one recorded without (after the guest failed
++    * to create its pipeline, say) crashed the whole VM. Such commands are dropped instead. */
++   bool graphics_pipeline_bound;
++   bool compute_pipeline_bound;
+ };
+ VKR_DEFINE_OBJECT_CAST(command_buffer, VK_OBJECT_TYPE_COMMAND_BUFFER, VkCommandBuffer)
+ 

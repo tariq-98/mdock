@@ -1,0 +1,28 @@
+--- a/arch/arm64/kernel/process.c	2026-10-14 21:25:43
++++ b/arch/arm64/kernel/process.c	2026-10-14 21:25:51
+@@ -482,7 +482,7 @@
+ 
+ #ifdef CONFIG_ARM64_ACTLR_STATE
+ 		if (system_has_actlr_state())
+-			p->thread.actlr = read_sysreg(actlr_el1);
++			p->thread.actlr = current->thread.actlr; /* mdock: no trap */
+ #endif
+ 
+ 		if (stack_start) {
+@@ -792,8 +792,14 @@
+ 	if (!system_has_actlr_state())
+ 		return;
+ 
+-	current->thread.actlr = read_sysreg(actlr_el1);
+-	write_sysreg(next->thread.actlr, actlr_el1);
++	/*
++	 * mdock: in a VM every ACTLR_EL1 access traps to the hypervisor (microseconds), and this ran on
++	 * every context switch: a native pipe ping-pong got 24% slower. thread.actlr always matches the
++	 * register while its task runs (PR_SET_MEM_MODEL updates both), so only write it when the next
++	 * task's value differs.
++	 */
++	if (current->thread.actlr != next->thread.actlr)
++		write_sysreg(next->thread.actlr, actlr_el1);
+ }
+ #else
+ static inline void actlr_thread_switch(struct task_struct *next)

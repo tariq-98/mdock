@@ -1,0 +1,17 @@
+--- a/src/gallium/drivers/zink/zink_screen.c	2025-08-27 17:58:02
++++ b/src/gallium/drivers/zink/zink_screen.c	2026-10-14 19:45:29
+@@ -3754,10 +3754,11 @@
+ 
+    if (ret)
+       ret->drm_fd = os_dupfd_cloexec(fd);
++   /* mdock: Venus on a macOS host (MoltenVK) can't export memory as fds. Without the extension
++    * only dma-buf sharing (EGLImage/GBM export) is unavailable; rendering and compute work, so
++    * keep the screen instead of failing (which left OpenCL with no device at all). */
+    if (ret && !ret->info.have_KHR_external_memory_fd) {
+-      debug_printf("ZINK: KHR_external_memory_fd required!\n");
+-      zink_destroy_screen(&ret->base);
+-      return NULL;
++      mesa_logw("ZINK: no KHR_external_memory_fd: buffers can't be shared as dma-bufs");
+    }
+ 
+    return &ret->base;

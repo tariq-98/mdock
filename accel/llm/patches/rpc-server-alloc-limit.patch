@@ -1,0 +1,56 @@
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index 158a15b..f9eb102 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -1246,15 +1246,36 @@ bool rpc_server::get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_
+     return true;
+ }
+ 
++// mdock: GGML_RPC_MAX_ALLOC_MB caps the memory one client may allocate on this server.
++static size_t rpc_server_alloc_limit() {
++    const char * env = getenv("GGML_RPC_MAX_ALLOC_MB");
++    return env && *env ? (size_t) strtoull(env, nullptr, 10) << 20 : SIZE_MAX;
++}
++
++static size_t rpc_server_allocated(const std::unordered_set<ggml_backend_buffer_t> & buffers) {
++    size_t total = 0;
++    for (auto buffer : buffers) {
++        total += ggml_backend_buffer_get_size(buffer);
++    }
++    return total;
++}
++
+ bool rpc_server::alloc_buffer(const rpc_msg_alloc_buffer_req & request, rpc_msg_alloc_buffer_rsp & response) {
+     uint32_t dev_id = request.device;
+     if (dev_id >= backends.size()) {
+         return false;
+     }
+-    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backends[dev_id]);
+-    ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(buft, request.size);
+     response.remote_ptr = 0;
+     response.remote_size = 0;
++    const size_t limit = rpc_server_alloc_limit();
++    const size_t used  = rpc_server_allocated(buffers);
++    if (request.size > limit || used > limit - request.size) {
++        GGML_LOG_ERROR("[%s] refusing %" PRIu64 " bytes: %zu of %zu MiB already allocated (GGML_RPC_MAX_ALLOC_MB)\n",
++                       __func__, request.size, used >> 20, limit >> 20);
++        return true;
++    }
++    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backends[dev_id]);
++    ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(buft, request.size);
+     if (buffer != nullptr) {
+         response.remote_ptr = reinterpret_cast<uint64_t>(buffer);
+         response.remote_size = buffer->size;
+@@ -1807,6 +1828,12 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
+     size_t free, total;
+     ggml_backend_dev_t dev = ggml_backend_get_device(backends[dev_id]);
+     ggml_backend_dev_memory(dev, &free, &total);
++    const size_t limit = rpc_server_alloc_limit();
++    if (limit != SIZE_MAX) {
++        const size_t used = rpc_server_allocated(buffers);
++        total = std::min(total, limit);
++        free  = std::min(free, used < limit ? limit - used : 0);
++    }
+     response.free_mem = free;
+     response.total_mem = total;
+     LOG_DBG("[%s] device: %u, free_mem: %" PRIu64 ", total_mem: %" PRIu64 "\n", __func__, dev_id, response.free_mem, response.total_mem);

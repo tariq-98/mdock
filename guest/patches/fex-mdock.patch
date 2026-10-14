@@ -1,0 +1,111 @@
+diff -ruN a/Source/Common/FEXServerClient.cpp b/Source/Common/FEXServerClient.cpp
+--- a/Source/Common/FEXServerClient.cpp	2026-10-14 21:26:48
++++ b/Source/Common/FEXServerClient.cpp	2026-10-14 21:26:48
+@@ -253,6 +253,18 @@
+   return true;
+ }
+ 
++bool SetupClientIfRunning() {
++  ServerFD = ConnectToServer(ConnectionOption::NoPrintConnectionError);
++  if (ServerFD == -1) {
++    return false;
++  }
++
++  if (FEXCore::Config::FindContainer() != "pressure-vessel") {
++    FEXCore::Config::Set(FEXCore::Config::CONFIG_ROOTFS, FEXServerClient::RequestRootFSPath(ServerFD));
++  }
++  return true;
++}
++
+ int StartServer(std::string_view InterpreterPath, int watch_fd) {
+   int LocalServerFD {-1};
+   // Couldn't connect to the server. Start one
+diff -ruN a/Source/Common/FEXServerClient.h b/Source/Common/FEXServerClient.h
+--- a/Source/Common/FEXServerClient.h	2026-10-14 21:26:48
++++ b/Source/Common/FEXServerClient.h	2026-10-14 21:26:48
+@@ -68,6 +68,12 @@
+ int GetServerFD();
+ 
+ bool SetupClient(std::string_view InterpreterPath);
++/**
++ * @brief mdock: like SetupClient, but only with a FEXServer that is already running; never starts one.
++ *
++ * @return true if connected
++ */
++bool SetupClientIfRunning();
+ 
+ /**
+  * @brief Start a FEXServer instance if possible
+diff -ruN a/Source/Tools/FEXInterpreter/FEXInterpreter.cpp b/Source/Tools/FEXInterpreter/FEXInterpreter.cpp
+--- a/Source/Tools/FEXInterpreter/FEXInterpreter.cpp	2026-10-14 21:26:48
++++ b/Source/Tools/FEXInterpreter/FEXInterpreter.cpp	2026-10-14 22:03:49
+@@ -440,10 +440,11 @@
+ 
+   // Ensure FEXServer is setup before config options try to pull CONFIG_ROOTFS
+   auto SelfPath = FEX::GetSelfPath();
+-  if (!FEXServerClient::SetupClient(SelfPath.value_or(argv[0]))) {
+-    LogMan::Msg::EFmt("FEXServerClient: Failure to setup client");
+-    return -1;
+-  }
++  // mdock: FEX is the binfmt handler for x86 programs in containers, whose root already is the x86
++  // root filesystem. FEXServer (squashfs rootfs mounting, log collection) isn't in there, and failing
++  // to start it failed every program: use a server only if one is already running.
++  (void)SelfPath;
++  FEXServerClient::SetupClientIfRunning();
+ 
+   FEX_CONFIG_OPT(LDPath, ROOTFS);
+   FEX_CONFIG_OPT(Environment, ENV);
+@@ -491,7 +492,30 @@
+     putenv(HostEnv.data());
+   }
+ 
+-  ELFCodeLoader Loader {Program.ProgramPath, FEXFD, LDPath(), Args, ParsedArgs, envp, &Environment};
++  // mdock: Go programs preempt goroutines with signals (SIGURG), and FEX doesn't deliver those at a
++  // point where Go can safely redirect the thread: Go then crashes at random. Have Go preempt at
++  // function calls instead (GODEBUG=asyncpreemptoff=1, its behavior before Go 1.14), unless the
++  // program's environment already says otherwise.
++  fextl::string GoDebug {"GODEBUG=asyncpreemptoff=1"};
++  fextl::vector<char*> GuestEnvp;
++  bool HasGoDebug = false;
++  for (char* const* Env = envp; Env && *Env; ++Env) {
++    if (strncmp(*Env, "GODEBUG=", 8) == 0) {
++      HasGoDebug = true;
++      if (!strstr(*Env, "asyncpreemptoff=")) {
++        GoDebug = fextl::fmt::format("{},asyncpreemptoff=1", *Env);
++        GuestEnvp.push_back(GoDebug.data());
++        continue;
++      }
++    }
++    GuestEnvp.push_back(*Env);
++  }
++  if (!HasGoDebug) {
++    GuestEnvp.push_back(GoDebug.data());
++  }
++  GuestEnvp.push_back(nullptr);
++
++  ELFCodeLoader Loader {Program.ProgramPath, FEXFD, LDPath(), Args, ParsedArgs, GuestEnvp.data(), &Environment};
+   FEXCore::Config::Set(FEXCore::Config::CONFIG_IS64BIT_MODE, Loader.Is64BitMode() ? "1" : "0");
+ 
+   if (!Loader.ELFWasLoaded()) {
+--- a/Source/Tools/FEXInterpreter/ELFCodeLoader.h	2026-10-14 22:17:04
++++ b/Source/Tools/FEXInterpreter/ELFCodeLoader.h	2026-10-14 22:17:04
+@@ -657,14 +657,16 @@
+       if (!VSyscallEntry) [[unlikely]] {
+         // If the VDSO thunk doesn't exist then we might not have a vsyscall entry.
+         // Newer glibc requires vsyscall to exist now. So let's allocate a buffer and stick a vsyscall in to it.
+-        auto VSyscallPage =
+-          Handler->GuestMmap(Thread, nullptr, FEXCore::Utils::FEX_PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
++        // mdock: map it executable, so the guest's VMA tracking lets code run there (32-bit musl calls
++        // AT_SYSINFO for every syscall; a PROT_READ page made each one a NoExec fault).
++        auto VSyscallPage = Handler->GuestMmap(Thread, nullptr, FEXCore::Utils::FEX_PAGE_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC,
++                                               MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+         constexpr static uint8_t VSyscallCode[] = {
+           0xcd, 0x80, // int 0x80
+           0xc3,       // ret
+         };
+         memcpy(VSyscallPage, VSyscallCode, sizeof(VSyscallCode));
+-        mprotect(VSyscallPage, FEXCore::Utils::FEX_PAGE_SIZE, PROT_READ);
++        mprotect(VSyscallPage, FEXCore::Utils::FEX_PAGE_SIZE, PROT_READ | PROT_EXEC);
+         VSyscallEntry = reinterpret_cast<uint64_t>(VSyscallPage);
+       }
+ 

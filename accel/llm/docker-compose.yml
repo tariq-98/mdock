@@ -1,0 +1,44 @@
+# Examples of containers using the Mac's GPU through mdock-llm (docker context: mdock).
+#   docker compose -f accel/llm/docker-compose.yml up
+#
+# Put GGUF models in ~/.mdock/models on the Mac (or name a Hugging Face model as owner/repo:file.gguf).
+services:
+  # Any OpenAI client: point it at http://llm.mdock.internal:8200/v1. No API key is checked,
+  # but most SDKs insist on one being set.
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    ports: ["3000:8080"]
+    environment:
+      OPENAI_API_BASE_URL: http://llm.mdock.internal:8200/v1
+      OPENAI_API_KEY: mdock
+      # Or as an Ollama server:
+      # OLLAMA_BASE_URL: http://llm.mdock.internal:8200
+    volumes:
+      - open-webui:/app/backend/data
+
+  # A one-shot client using the plain HTTP API.
+  ask:
+    image: curlimages/curl:8.11.1
+    profiles: [demo]
+    command:
+      - -sS
+      - http://llm.mdock.internal:8200/v1/chat/completions
+      - -H
+      - "Content-Type: application/json"
+      - -d
+      - '{"model":"qwen2.5-0.5b-q4_k_m","messages":[{"role":"user","content":"Hello from a container"}]}'
+
+  # llama.cpp inside the container, with every layer offloaded to the Mac GPU over ggml RPC.
+  # The image must be built from the same llama.cpp tag as accel/llm/build.sh.
+  rpc-bench:
+    build: ./rpc-client
+    image: llm-rpc-client
+    profiles: [demo]
+    volumes:
+      - ${HOME}/.mdock/models:/models:ro
+    command: >
+      llama-bench -m /models/qwen2.5-0.5b-q4_k_m.gguf
+      --rpc llm.mdock.internal:50052 -dev RPC0 -ngl 99
+
+volumes:
+  open-webui:

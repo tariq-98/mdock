@@ -1,0 +1,27 @@
+diff -ruN a/src/devices/src/virtio/vsock/muxer.rs b/src/devices/src/virtio/vsock/muxer.rs
+--- a/src/devices/src/virtio/vsock/muxer.rs	2026-10-14 19:47:06
++++ b/src/devices/src/virtio/vsock/muxer.rs	2026-10-14 19:47:06
+@@ -148,8 +148,11 @@
+         self.mem = Some(mem.clone());
+         self.interrupt = Some(interrupt.clone());
+ 
++        // mdock: no time-sync datagrams. Only libkrunfw's kernel understands them; mdock's guest
++        // (chrony keeps its clock) answers each with a reset, logged as an error, and the thread
++        // woke every 2 s for nothing.
+         #[cfg(target_os = "macos")]
+-        {
++        if std::env::var_os("KRUN_TIMESYNC").is_some() {
+             let timesync =
+                 TimesyncThread::new(self.cid, mem.clone(), queue.clone(), interrupt.clone());
+             timesync.run();
+@@ -533,6 +536,10 @@
+             _ => {
+                 if pkt.op() == uapi::VSOCK_OP_RW {
+                     self.process_dgram_rw(pkt);
++                } else if pkt.op() == uapi::VSOCK_OP_RST {
++                    // mdock: a guest without TSI resets the datagram connect responses meant for
++                    // libkrunfw's kernel (every port-mapped connection gets one); not an error.
++                    debug!("dgram reset from port {}", pkt.src_port());
+                 } else {
+                     error!("unexpected dgram pkt: {}", pkt.op());
+                 }

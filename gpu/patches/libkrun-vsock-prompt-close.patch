@@ -1,0 +1,55 @@
+diff -ruN a/src/devices/src/virtio/vsock/unix.rs b/src/devices/src/virtio/vsock/unix.rs
+--- a/src/devices/src/virtio/vsock/unix.rs	2026-10-14 19:13:49
++++ b/src/devices/src/virtio/vsock/unix.rs	2026-10-14 19:13:49
+@@ -341,17 +341,18 @@
+         let recv_off = pkt.flags() & uapi::VSOCK_FLAGS_SHUTDOWN_RCV != 0;
+         let send_off = pkt.flags() & uapi::VSOCK_FLAGS_SHUTDOWN_SEND != 0;
+ 
+-        let how = if recv_off && send_off {
+-            Shutdown::Both
+-        } else if recv_off {
+-            Shutdown::Read
+-        } else {
+-            Shutdown::Write
+-        };
+-
+-        if let Err(e) = shutdown(self.fd.as_raw_fd(), how) {
+-            warn!("error sending shutdown to socket: {e}");
++        // mdock: one direction at a time, the write side first. macOS refuses SHUT_RDWR (and SHUT_RD)
++        // with ENOTCONN on a unix socket whose peer already shut its write side, and then shuts
++        // nothing: after a host half-close (the docker CLI closes stdin of every attach) the host
++        // never saw EOF until the socket was finally closed.
++        if send_off {
++            if let Err(e) = shutdown(self.fd.as_raw_fd(), Shutdown::Write) {
++                debug!("error sending shutdown to socket: {e}");
++            }
+         }
++        if recv_off {
++            let _ = shutdown(self.fd.as_raw_fd(), Shutdown::Read);
++        }
+     }
+ }
+ 
+@@ -597,9 +598,22 @@
+             ProxyStatus::ReverseInit | ProxyStatus::Connecting => ProxyRemoval::Immediate,
+             _ => ProxyRemoval::Deferred,
+         };
++        if !matches!(remove_proxy, ProxyRemoval::Deferred) {
++            return ProxyUpdate {
++                remove_proxy,
++                ..Default::default()
++            };
++        }
+ 
++        // mdock: the connection is over (reset, or shut down both ways). The proxy lingers in the
++        // reaper for 5 s to reserve its port, and so did its socket: give the host EOF now (write
++        // side first, see do_shutdown), and stop polling the socket, which stays readable at EOF
++        // and kept the event loop spinning until the reaper dropped it.
++        let _ = shutdown(self.fd.as_raw_fd(), Shutdown::Write);
++        let _ = shutdown(self.fd.as_raw_fd(), Shutdown::Read);
+         ProxyUpdate {
+             remove_proxy,
++            polling: Some((self.id, self.fd.as_raw_fd(), EventSet::empty())),
+             ..Default::default()
+         }
+     }

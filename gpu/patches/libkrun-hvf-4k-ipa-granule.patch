@@ -1,0 +1,23 @@
+--- a/src/hvf/src/lib.rs
++++ b/src/hvf/src/lib.rs
+@@ -264,6 +264,20 @@
+             let ret = unsafe { (set_el2_enabled)(config, true) };
+             if ret != HV_SUCCESS {
+                 return Err(Error::EnableEL2);
++            }
++        }
++
++        // mdock: on macOS 26+, map guest memory at 4 KiB granularity. Linux guests use 4 KiB
++        // pages, and virtio-gpu blobs (Venus) land at 4 KiB-aligned offsets in the host window;
++        // with the default 16 KiB granule hv_vm_map rejects them and stock Mesa fails with
++        // VK_ERROR_OUT_OF_HOST_MEMORY.
++        if let Ok(set_ipa_granule) = unsafe {
++            HVF.get::<unsafe extern "C" fn(hv_vm_config_t, u32) -> hv_return_t>(b"hv_vm_config_set_ipa_granule")
++        } {
++            const HV_IPA_GRANULE_4KB: u32 = 0;
++            let ret = unsafe { (set_ipa_granule)(config, HV_IPA_GRANULE_4KB) };
++            if ret != HV_SUCCESS {
++                log::warn!("hv_vm_config_set_ipa_granule(4KB) failed: {ret}");
+             }
+         }
+ 

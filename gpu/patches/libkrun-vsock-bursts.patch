@@ -1,0 +1,78 @@
+diff -ruN a/src/devices/src/virtio/vsock/mod.rs b/src/devices/src/virtio/vsock/mod.rs
+--- a/src/devices/src/virtio/vsock/mod.rs	2026-09-29 10:14:22
++++ b/src/devices/src/virtio/vsock/mod.rs	2026-10-14 20:01:52
+@@ -71,7 +71,10 @@
+     pub const MAX_PKT_BUF_SIZE: usize = 64 * 1024;
+ 
+     /// Size of the muxer RX packet queue.
+-    pub const MUXER_RXQ_SIZE: usize = 256;
++    // mdock: was 256. Packets for the guest wait here while its RX ring is full, and a full queue
++    // dropped them (connection requests, replies, resets): 18% of a 64-way burst of docker API
++    // calls came back empty. An entry is a few dozen bytes.
++    pub const MUXER_RXQ_SIZE: usize = 16384;
+ 
+     // Kernel side doesn't play nice with us supporting so many bytes
+     //pub const CONN_TX_BUF_SIZE: usize = i32::MAX as usize;
+diff -ruN a/src/devices/src/virtio/vsock/muxer.rs b/src/devices/src/virtio/vsock/muxer.rs
+--- a/src/devices/src/virtio/vsock/muxer.rs	2026-10-14 20:01:52
++++ b/src/devices/src/virtio/vsock/muxer.rs	2026-10-14 20:01:52
+@@ -96,9 +96,11 @@
+             }
+         }
+     } else {
+-        error!("couldn't push pkt to queue, adding it to rxq");
++        debug!("couldn't push pkt to queue, adding it to rxq");
+         drop(queue);
+-        rxq_mutex.lock().unwrap().push(rx);
++        if !rxq_mutex.lock().unwrap().push(rx) {
++            error!("vsock: guest RX backlog full, packet dropped");
++        }
+     }
+ }
+ 
+@@ -573,7 +575,7 @@
+                 }
+                 let rxq = self.rxq.clone();
+ 
+-                let mut unix = UnixProxy::new(
++                let mut unix = match UnixProxy::new(
+                     id,
+                     self.cid,
+                     pkt.dst_port(),
+@@ -582,8 +584,20 @@
+                     queue.clone(),
+                     rxq,
+                     path.to_path_buf(),
+-                )
+-                .unwrap();
++                ) {
++                    Ok(unix) => unix,
++                    Err(e) => {
++                        // mdock: refuse this connection; unwrap() here (out of descriptors, say)
++                        // aborted the process and took the whole VM down.
++                        warn!("vsock: connecting to {path:?} failed: {e:?}");
++                        let rx = MuxerRx::Reset {
++                            local_port: pkt.dst_port(),
++                            peer_port: pkt.src_port(),
++                        };
++                        push_packet(self.cid, rx, &self.rxq, queue, mem);
++                        return;
++                    }
++                };
+                 let tsi = TsiConnectReq {
+                     peer_port: 0,
+                     addr: SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0).into(),
+diff -ruN a/src/devices/src/virtio/vsock/unix.rs b/src/devices/src/virtio/vsock/unix.rs
+--- a/src/devices/src/virtio/vsock/unix.rs	2026-10-14 20:01:52
++++ b/src/devices/src/virtio/vsock/unix.rs	2026-10-14 20:01:52
+@@ -726,7 +726,9 @@
+             &UnixAddr::new(path).map_err(ProxyError::CreatingSocket)?,
+         )
+         .map_err(ProxyError::CreatingSocket)?;
+-        listen(&fd, Backlog::new(5).map_err(ProxyError::CreatingSocket)?)
++        // mdock: a backlog of 5 refused bursts of parallel connections (docker clients, compose,
++        // IDEs), which reached the guest as empty replies. 128, like the guest's own listeners.
++        listen(&fd, Backlog::new(128).map_err(ProxyError::CreatingSocket)?)
+             .map_err(ProxyError::CreatingSocket)?;
+         Ok(UnixAcceptorProxy { id, fd, peer_port })
+     }

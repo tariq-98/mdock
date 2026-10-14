@@ -1,0 +1,30 @@
+# macOS
+.DS_Store
+
+# Swift build outputs and the packaged app
+.build/
+.build-*/
+/dist/
+
+# Downloaded sources and compiled outputs: each build.sh fetches, verifies and builds its own
+cli/src/
+cli/out/
+guest/src/
+guest/out/
+kernel/src/
+kernel/out/
+gpu/src/
+gpu/prefix/
+gpu/guest/*.tar.xz
+accel/vaapi/out/
+accel/media/src/
+accel/media/prefix/
+accel/media/*.log
+
+# Local data: models, test media, and the Jellyfin server's state (including its credentials)
+/models/
+/media-test/
+/jellyfin/
+
+# Kept local: notes from studying Docker Desktop's binaries
+docs/docker-desktop-analysis.md
