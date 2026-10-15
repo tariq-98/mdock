@@ -328,22 +328,6 @@ enum Sockets {
         return fd
     }
 
-    /// A UDP socket connected to host:port (IPv4).
-    static func udpConnect(host: String, port: UInt16) -> Int32? {
-        let fd = socket(AF_INET, SOCK_DGRAM, 0)
-        guard fd >= 0 else { return nil }
-        var addr = sockaddr_in()
-        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-        addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port = port.bigEndian
-        inet_pton(AF_INET, host, &addr.sin_addr)
-        let ok = withUnsafePointer(to: &addr) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
-        }
-        if ok != 0 { close(fd); return nil }
-        return fd
-    }
-
     @discardableResult
     static func writeAll(_ fd: Int32, _ bytes: UnsafeRawPointer, _ count: Int) -> Bool {
         var offset = 0

@@ -19,6 +19,9 @@ enum Guest {
     static let fileEventsPort: UInt32 = 2377
     /// Vsock port of mdock-guestd's UDP relay for published UDP ports.
     static let udpPort: UInt32 = 2378
+    /// Vsock port where mdock-guestd takes requests to dial back to the Mac for published TCP ports
+    /// (DialBack).
+    static let dialBackPort: UInt32 = 2379
     /// Vsock port the host listens on for host.docker.internal: mdock-guestd sends "<port>\n" and
     /// the connection's bytes, and the host connects to its own loopback.
     static let hostForwardPort: UInt32 = 1031
@@ -211,6 +214,7 @@ enum Guest {
       $guestd relay 2376 &
       $guestd notify 2377 &
       $guestd udp 2378 &
+      $guestd dialback 2379 &
     else
       # nofork: mdock-relay gets the vsock connection itself as stdin/stdout (no extra hop).
       socat -t 86400 VSOCK-LISTEN:2376,reuseaddr,fork,backlog=128 EXEC:/usr/local/sbin/mdock-relay,nofork &

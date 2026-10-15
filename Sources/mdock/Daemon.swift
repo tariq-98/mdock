@@ -72,15 +72,16 @@ final class Daemon: NSObject, VZVirtualMachineDelegate, VZVirtioSocketListenerDe
     /// The container that last kept the VM from an idle stop (logged once per container).
     private var idleVeto: String?
 
-    /// Published ports normally go straight to the guest's IP over vmnet. A daemon started by launchd
-    /// counts as its own app for macOS's Local Network privacy check, which blocks connections into
-    /// the VM's subnet (and an ad-hoc signed build would need re-approving after every rebuild), so
-    /// it relays every port over vsock instead, as the GPU engine (guest behind gvproxy) always does.
-    private let directForwarding: Bool
+    /// Published TCP ports reach the guest over the VM's network (DialBack, several GB/s) once the guest
+    /// is ready, else over the vsock relay (~0.6 GB/s), which the GPU engine (guest behind gvproxy)
+    /// always uses. After a dial-back fails, ports use the relay until `dialBackRetryAt` (uptime).
+    private var dialBack: DialBack?
+    private var dialBackFailed = false
+    private var dialBackRetryAt: UInt64 = 0
+    private var dialBackStarting = false
 
     init(config: Config) {
         self.config = config
-        directForwarding = !config.gpu && !LaunchAgent.supervising
     }
 
     // MARK: VM configuration
@@ -493,6 +494,7 @@ final class Daemon: NSObject, VZVirtualMachineDelegate, VZVirtioSocketListenerDe
         guard let kind = words.first else { return }
         switch kind {
         case "ready" where words.count >= 2:
+            if !config.gpu { Thread.detachNewThread { [self] in startDialBack(words[1]) } }
             stateLock.withLock {
                 guestIP = words[1]
                 if !ready {
@@ -631,8 +633,8 @@ final class Daemon: NSObject, VZVirtualMachineDelegate, VZVirtioSocketListenerDe
         let listener = try Sockets.unixListen(Paths.internalSocket.path)
         Sockets.acceptLoop(listener) { [self] client in
             Thread.detachNewThread { [self] in
-                guard waitUntilReady(), let guest = vsockConnect(Guest.dockerPort) else { close(client); return }
-                Sockets.splice(client, guest, vsock: guest)
+                guard waitUntilReady(), let guest = dockerConnect() else { close(client); return }
+                Sockets.splice(client, guest.fd, vsock: guest.vsock ? guest.fd : nil)
             }
         }
     }
@@ -672,12 +674,12 @@ final class Daemon: NSObject, VZVirtualMachineDelegate, VZVirtioSocketListenerDe
                 }
             }
             // A command that started mdock (or arrived while it boots) waits for Docker, not an error.
-            guard waitUntilReady(), let guest = vsockConnect(Guest.dockerPort) else {
+            guard waitUntilReady(), let guest = dockerConnect() else {
                 close(client)
                 finished()
                 return
             }
-            Sockets.splice(client, guest, vsock: guest, onClose: finished)
+            Sockets.splice(client, guest.fd, vsock: guest.vsock ? guest.fd : nil, onClose: finished)
         }
     }
 
@@ -788,6 +790,8 @@ final class Daemon: NSObject, VZVirtualMachineDelegate, VZVirtioSocketListenerDe
             "guestMemAvailableMiB": memAvailKiB / 1024,
             "bootSeconds": readyAt.map { $0.timeIntervalSince(startedAt) } ?? -1,
             "forwards": forwards.keys.sorted(),
+            // How published ports reach the guest right now (already under stateLock).
+            "portPath": config.gpu ? "relay" : dialBackFailed ? "relay (fallback)" : "direct",
             "bridgeStalled": bridgeStalled,
             "supervised": LaunchAgent.supervising,
             "kubernetes": ["state": k8sState, "version": k8sVersion, "ports": k8sPorts],
@@ -810,20 +814,29 @@ final class Daemon: NSObject, VZVirtualMachineDelegate, VZVirtioSocketListenerDe
 
     // MARK: host.docker.internal
 
-    /// mdock-guestd sends "<port>\n"; once connected to the Mac's own loopback (IPv4, then IPv6, where
-    /// `localhost` servers often bind) this side answers one byte (1) and the connection's bytes
-    /// follow. Loopback isn't subject to Local Network privacy, so this works under launchd too.
+    /// host.docker.internal over vsock (until dial-back is up, and on an older guest): mdock-guestd sends
+    /// "<port>\n"; once connected to the Mac's own loopback (IPv4, then IPv6, where `localhost` servers
+    /// often bind) this side answers one byte (1) and the connection's bytes follow. Loopback isn't
+    /// subject to Local Network privacy, so this works under launchd too.
     private func handleHostForward(_ fd: Int32) {
-        Thread.detachNewThread {
-            guard let line = Sockets.readLine(fd, limit: 16), let port = UInt16(line), port > 0,
-                  let upstream = Sockets.tcpConnect(host: "127.0.0.1", port: port) ?? Sockets.tcp6Connect(host: "::1", port: port)
-            else {
-                close(fd)  // mdock-guestd resets the client: the port is closed on the Mac
+        Thread.detachNewThread { [self] in
+            guard let line = Sockets.readLine(fd, limit: 16), let port = UInt16(line), port > 0 else {
+                close(fd)
                 return
             }
-            Sockets.writeAll(fd, "\u{1}")  // connected
-            Sockets.splice(fd, upstream, vsock: fd)
+            forwardToMac(fd, port: port, vsock: true)
         }
+    }
+
+    /// Connects a host.docker.internal connection mdock-guestd made (over vsock, or over the VM's
+    /// network through DialBack) to `port` on the Mac's own loopback.
+    private func forwardToMac(_ fd: Int32, port: UInt16, vsock: Bool) {
+        guard let upstream = Sockets.tcpConnect(host: "127.0.0.1", port: port) ?? Sockets.tcp6Connect(host: "::1", port: port) else {
+            close(fd)  // mdock-guestd resets the client: the port is closed on the Mac
+            return
+        }
+        Sockets.writeAll(fd, "\u{1}")  // connected
+        Sockets.splice(fd, upstream, vsock: vsock ? fd : nil)
     }
 
     // MARK: File events
@@ -1025,20 +1038,17 @@ final class Daemon: NSObject, VZVirtualMachineDelegate, VZVirtioSocketListenerDe
             log("forward \(key) removed")
         }
         for (key, spec) in wanted where existing[key] == nil {
-            // Guest-loopback bindings are only reachable from inside the guest, so they always take
-            // the vsock relay; so does everything when direct forwarding is off.
-            let viaRelay = spec.host != nil || !directForwarding
             do {
                 // macOS lets only root bind low ports on loopback; take every interface instead and
                 // turn away peers that aren't on this Mac.
                 let lowLoopback = spec.host == "127.0.0.1" && spec.port < 1024
                 let bindHost = lowLoopback ? nil : spec.host
                 if spec.udp {
-                    let forward = try UDPForward(host: bindHost, port: spec.port, upstream: viaRelay
-                        ? .relay(connect: { [self] port in udpRelayConnect(port) })
-                        : .direct(ip: ip), loopbackOnly: lowLoopback)
+                    // Over the vsock relay: datagrams have no connection for the guest to dial back.
+                    let forward = try UDPForward(host: bindHost, port: spec.port, connect: { [self] port in udpRelayConnect(port) },
+                                                 loopbackOnly: lowLoopback)
                     stateLock.withLock { forwards[key] = forward.cancel }
-                    log("forward \(key) -> \(viaRelay ? "vsock relay" : ip):\(spec.port)")
+                    log("forward \(key) -> \(ip):\(spec.port)")
                     continue
                 }
                 let listener = try Sockets.tcpListen(host: bindHost, port: spec.port)
@@ -1049,27 +1059,116 @@ final class Daemon: NSObject, VZVirtualMachineDelegate, VZVirtioSocketListenerDe
                         return
                     }
                     Thread.detachNewThread { [self] in
-                        var upstream: Int32?
-                        var vsock = viaRelay
-                        for attempt in 0..<5 where upstream == nil {
-                            if attempt > 0 { usleep(UInt32(100_000 * attempt)) }
-                            upstream = viaRelay ? relayConnect(spec.port) : Sockets.tcpConnect(host: ip, port: spec.port)
+                        guard let upstream = forwardConnect(spec.port) else {
+                            close(client)
+                            return
                         }
-                        // vmnet unreachable (a VPN hijacking the subnet, say): the relay still works.
-                        if upstream == nil, !viaRelay {
-                            upstream = relayConnect(spec.port)
-                            vsock = true
-                        }
-                        guard let upstream else { close(client); return }
-                        Sockets.splice(client, upstream, vsock: vsock ? upstream : nil)
+                        Sockets.splice(client, upstream.fd, vsock: upstream.vsock ? upstream.fd : nil)
                     }
                 }
                 stateLock.withLock { forwards[key] = cancel }
-                log("forward \(key) -> \(viaRelay ? "vsock relay" : ip):\(spec.port)")
+                log("forward \(key) -> \(ip):\(spec.port)")
             } catch {
                 log("forward \(key) failed: \(error)")
             }
         }
+    }
+
+    /// Sets up DialBack once the guest is ready. mdock-guestd listens for it just before the guest
+    /// reports ready; an older guest without it keeps every port on the relay.
+    private func startDialBack(_ ip: String) {
+        let start = stateLock.withLock { () -> Bool in
+            guard dialBack == nil, !dialBackStarting else { return false }
+            dialBackStarting = true
+            return true
+        }
+        guard start else { return }
+        defer { stateLock.withLock { dialBackStarting = false } }
+        for attempt in 0..<10 {
+            if attempt > 0 { usleep(200_000) }
+            if let dialBack = DialBack.start(guestIP: ip, connect: { [self] in vsockConnect(Guest.dialBackPort) },
+                                             hostForward: { [self] fd, port in forwardToMac(fd, port: port, vsock: false) }) {
+                stateLock.withLock {
+                    self.dialBack = dialBack
+                    dialBackFailed = false
+                    dialBackRetryAt = 0
+                }
+                log("published ports and the Docker API reach the guest over the VM's network (dialing back to \(dialBack.address))")
+                return
+            }
+        }
+        if stateLock.withLock({ () -> Bool in defer { dialBackFailed = true }; return !dialBackFailed }) {
+            log("published ports and the Docker API use vsock: the guest can't dial back over the VM's network")
+        }
+    }
+
+    /// A connection to `target` in the guest over the VM's network (DialBack.connect). A failure to
+    /// dial back is remembered for a minute, so connections don't each wait for it; then it is tried
+    /// again (set up again, if mdock-guestd's end went away).
+    private func dialBackConnect(_ target: String) -> DialBack.Outcome {
+        let (dialBack, restart) = stateLock.withLock { () -> (DialBack?, String?) in
+            let now = DispatchTime.now().uptimeNanoseconds
+            // A VM on its way down won't dial back; that's no failure to report.
+            guard stopStatus == nil, now >= dialBackRetryAt else { return (nil, nil) }
+            guard let dialBack = self.dialBack else {
+                dialBackRetryAt = now + 60_000_000_000
+                return (nil, config.gpu ? nil : guestIP)
+            }
+            return (dialBack, nil)
+        }
+        if let restart { Thread.detachNewThread { [self] in startDialBack(restart) } }
+        guard let dialBack else { return .unavailable }
+        let outcome = dialBack.connect(target)
+        switch outcome {
+        case .connected:
+            if stateLock.withLock({ () -> Bool in defer { dialBackFailed = false }; return dialBackFailed }) {
+                log("the guest dials back over the VM's network again")
+            }
+        case .refused:
+            break
+        case .unavailable:
+            let first = stateLock.withLock { () -> Bool in
+                defer {
+                    dialBackFailed = true
+                    dialBackRetryAt = DispatchTime.now().uptimeNanoseconds + 60_000_000_000
+                    if dialBack.isClosed && self.dialBack === dialBack { self.dialBack = nil }
+                }
+                return !dialBackFailed
+            }
+            if first { log("the guest didn't dial back (\(target)): published ports and the Docker API use vsock for a minute") }
+        }
+        return outcome
+    }
+
+    /// A connection to a published port in the guest, and whether it is a vsock stream: dialed back
+    /// over the VM's network when that works, else over the vsock relay. A port that isn't listening
+    /// yet (a container still starting) gets a few tries.
+    private func forwardConnect(_ port: UInt16) -> (fd: Int32, vsock: Bool)? {
+        for attempt in 0..<5 {
+            if attempt > 0 { usleep(UInt32(100_000 * attempt)) }
+            switch dialBackConnect("\(port)") {
+            case .connected(let fd): return (fd, false)
+            case .refused: continue
+            case .unavailable: return relayConnect(port, attempts: 5).map { ($0, true) }
+            }
+        }
+        return nil  // nothing listens there
+    }
+
+    /// A stream to the guest's Docker API, and whether it is a vsock stream: dialed back over the VM's
+    /// network when that works, so `docker save | gzip` or `docker logs | less` just slow dockerd
+    /// down; over vsock, a reader that falls 64 MiB behind loses its connection.
+    private func dockerConnect() -> (fd: Int32, vsock: Bool)? {
+        if case .connected(let fd) = dialBackConnect("unix:/var/run/docker.sock") { return (fd, false) }
+        return vsockConnect(Guest.dockerPort).map { ($0, true) }
+    }
+
+    private func relayConnect(_ port: UInt16, attempts: Int) -> Int32? {
+        for attempt in 0..<attempts {
+            if attempt > 0 { usleep(UInt32(100_000 * attempt)) }
+            if let fd = relayConnect(port) { return fd }
+        }
+        return nil
     }
 
     private func udpRelayConnect(_ port: UInt16) -> Int32? {

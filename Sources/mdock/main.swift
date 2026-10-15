@@ -208,7 +208,8 @@ func printStatus() {
         print("accel:     \(parts.joined(separator: ", "))")
     }
     let forwards = s["forwards"] as? [String] ?? []
-    print("ports:     \(forwards.isEmpty ? "none" : forwards.joined(separator: ", "))")
+    let path = ["relay": " (over the vsock relay)", "relay (fallback)": " (over the vsock relay: the VM's network path failed; see mdock doctor)"][s["portPath"] as? String ?? ""] ?? ""
+    print("ports:     \(forwards.isEmpty ? "none" : forwards.joined(separator: ", ") + path)")
     if let k8s = s["kubernetes"] as? [String: Any], let state = k8s["state"] as? String, state != "off" {
         let version = (k8s["version"] as? String).flatMap { $0.isEmpty ? nil : " \($0)" } ?? ""
         print("k8s:       \(state)\(version)\(state == "up" ? ", API \(Kubernetes.api) (context \(Kubernetes.context))" : "")")

@@ -87,6 +87,18 @@ enum Doctor {
                 fix: Kernel.buildOutput != nil ? "mdock kernel install && mdock restart"
                     : "~/mdock/kernel/build.sh && mdock kernel install && mdock restart", warnOnly: true)
         }
+        // Published TCP ports: dialed back over the VM's network, or the ~10x slower vsock relay.
+        if let path = s?["portPath"] as? String {
+            switch path {
+            case "direct":
+                add("published ports", true, "over the VM's network")
+            case "relay":
+                add("published ports", true, "over the vsock relay (the GPU engine's network is userspace)")
+            default:
+                add("published ports", false, "over the vsock relay: the guest can't dial back to the Mac over the VM's network",
+                    fix: "mdock restart; if it persists, see ~/.mdock/daemon.log (a firewall blocking mdock?)", warnOnly: true)
+            }
+        }
         // What runs x86 programs: Rosetta (default engine, amd64), FEX (needs hardware TSO), else QEMU.
         let built = Guest.binary("FEXInterpreter") != nil && Guest.binary("qemu-x86_64") != nil && Guest.binary("qemu-i386") != nil
         if let x86 = s?["x86"] as? [String: String], !x86.isEmpty {

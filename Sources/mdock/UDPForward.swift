@@ -1,30 +1,21 @@
 import Foundation
 
-/// A published UDP port on the Mac. Each client address gets its own flow to the container: a UDP
-/// socket aimed at the guest's IP (direct), or a vsock stream to mdock-guestd carrying datagrams as
-/// [2-byte big-endian length][payload] (relay). Flows idle for two minutes are closed. `cancel`
-/// stops the whole forward.
+/// A published UDP port on the Mac. Each client address gets its own flow to the container: a vsock
+/// stream to mdock-guestd carrying datagrams as [2-byte big-endian length][payload]. Flows idle for
+/// two minutes are closed. `cancel` stops the whole forward.
 final class UDPForward {
-    enum Upstream {
-        case direct(ip: String)
-        case relay(connect: (UInt16) -> Int32?)
-    }
-
     private final class Flow {
         let fd: Int32
-        let framed: Bool
         var lastActive = Date()
         var closed = false
-        init(fd: Int32, framed: Bool) {
-            self.fd = fd
-            self.framed = framed
-        }
+        init(fd: Int32) { self.fd = fd }
     }
 
     let cancel = Cancel()
     private let listener: Int32
     private let port: UInt16
-    private let upstream: Upstream
+    /// Opens a flow's stream to the guest for a port.
+    private let connect: (UInt16) -> Int32?
     private let lock = NSLock()
     private var flows: [Data: Flow] = [:]
 
@@ -32,11 +23,11 @@ final class UDPForward {
     /// datagrams from other machines are dropped.
     private let loopbackOnly: Bool
 
-    init(host: String?, port: UInt16, upstream: Upstream, loopbackOnly: Bool = false) throws {
+    init(host: String?, port: UInt16, connect: @escaping (UInt16) -> Int32?, loopbackOnly: Bool = false) throws {
         listener = try Sockets.udpBind(host: host, port: port)
         self.loopbackOnly = loopbackOnly
         self.port = port
-        self.upstream = upstream
+        self.connect = connect
         Thread.detachNewThread { [self] in receiveLoop() }
     }
 
@@ -63,13 +54,9 @@ final class UDPForward {
             }
             guard let flow = flow(for: addr, len) else { continue }
             lock.withLock { flow.lastActive = Date() }
-            if flow.framed {
-                buffer[0] = UInt8(n >> 8)
-                buffer[1] = UInt8(n & 0xff)
-                if !buffer.withUnsafeBytes({ Sockets.writeAll(flow.fd, $0.baseAddress!, n + 2) }) { end(flow) }
-            } else {
-                _ = buffer.withUnsafeBytes { send(flow.fd, $0.baseAddress! + 2, n, 0) }
-            }
+            buffer[0] = UInt8(n >> 8)
+            buffer[1] = UInt8(n & 0xff)
+            if !buffer.withUnsafeBytes({ Sockets.writeAll(flow.fd, $0.baseAddress!, n + 2) }) { end(flow) }
         }
         close(listener)
         sweep(idleFor: -1)
@@ -79,36 +66,22 @@ final class UDPForward {
         var addr = addr
         let key = withUnsafeBytes(of: &addr) { Data($0.prefix(Int(len))) }
         if let flow = lock.withLock({ flows[key] }) { return flow }
-        let flow: Flow
-        switch upstream {
-        case .direct(let ip):
-            guard let fd = Sockets.udpConnect(host: ip, port: port) else { return nil }
-            flow = Flow(fd: fd, framed: false)
-        case .relay(let connect):
-            guard let fd = connect(port) else { return nil }
-            flow = Flow(fd: fd, framed: true)
-        }
+        guard let fd = connect(port) else { return nil }
+        let flow = Flow(fd: fd)
         lock.withLock { flows[key] = flow }
         Thread.detachNewThread { [self] in replyLoop(flow, to: addr, len) }
         return flow
     }
 
-    /// Container -> client: datagrams (or frames) from the flow's upstream go back to the client.
+    /// Container -> client: frames from the flow's stream go back to the client as datagrams.
     private func replyLoop(_ flow: Flow, to addr: sockaddr_storage, _ len: socklen_t) {
         var addr = addr
         var buffer = [UInt8](repeating: 0, count: 65_535)
         while true {
-            var n: Int
-            if flow.framed {
-                var header = [UInt8](repeating: 0, count: 2)
-                guard Sockets.readFull(flow.fd, &header, 2) else { break }
-                n = Int(header[0]) << 8 | Int(header[1])
-                guard Sockets.readFull(flow.fd, &buffer, n) else { break }
-            } else {
-                n = recv(flow.fd, &buffer, buffer.count, 0)
-                if n < 0, errno == EINTR || errno == ECONNREFUSED { continue }
-                if n < 0 || (n == 0 && lock.withLock({ flow.closed })) { break }
-            }
+            var header = [UInt8](repeating: 0, count: 2)
+            guard Sockets.readFull(flow.fd, &header, 2) else { break }
+            let n = Int(header[0]) << 8 | Int(header[1])
+            guard Sockets.readFull(flow.fd, &buffer, n) else { break }
             lock.withLock { flow.lastActive = Date() }
             _ = withUnsafePointer(to: &addr) {
                 $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { sendto(listener, buffer, n, 0, $0, len) }

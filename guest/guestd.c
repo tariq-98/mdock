@@ -1,11 +1,21 @@
 // mdock-guestd: the guest side of mdock's host bridges. Runs inside the Linux VM.
 //
+//   mdock-guestd dialback [vsock-port]            Mac -> guest streams over the VM's network (2379), so
+//                                                 the bytes skip vsock (published ports, the Docker API):
+//                                                 the Mac sends "<ip> <port> <secret>\n", where it accepts
+//                                                 on that network, then "<id> <target>\n" per connection, the
+//                                                 target a port (127.0.0.1) or unix:<path>. Each connects
+//                                                 to its target, dials <ip>:<port>, sends "<id>\n" and
+//                                                 splices; failures go back on the stream as "<id>
+//                                                 refused" (nothing listening) or "<id> unreachable".
 //   mdock-guestd relay   [vsock-port]             Mac -> guest TCP for published ports (2376): reads
 //                                                 "<port>\n", connects 127.0.0.1:<port>, splices.
 //   mdock-guestd hostfwd [tcp-port] [vsock-port]  host.docker.internal -> the Mac's own localhost:
 //                                                 connections iptables REDIRECTs here (61080) go to the
-//                                                 Mac over vsock (1031): "<original port>\n", the Mac
-//                                                 answers 1 once connected, then the data.
+//                                                 Mac over the VM's network once dial-back has given us
+//                                                 its address and secret (/run/mdock/mac): "<secret>
+//                                                 <original port>\n"; else over vsock (1031): "<original
+//                                                 port>\n". The Mac answers 1 once connected, then the data.
 //   mdock-guestd udp     [vsock-port]             Mac -> guest UDP for published ports (2378): reads
 //                                                 "<port>\n", then datagrams framed [u16 length][data].
 //   mdock-guestd notify  [vsock-port]             Mac file changes -> inotify (2377): for each path
@@ -28,6 +38,7 @@
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <linux/netfilter_ipv4.h>
 #include <linux/vm_sockets.h>
@@ -104,6 +115,15 @@ static int connect_local(unsigned port) {
     return -1;
 }
 
+static int connect_unix(const char *path) {
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    struct sockaddr_un a = {.sun_family = AF_UNIX};
+    snprintf(a.sun_path, sizeof a.sun_path, "%s", path);
+    if (fd >= 0 && connect(fd, (struct sockaddr *)&a, sizeof a) == 0) return fd;
+    if (fd >= 0) close(fd);
+    return -1;
+}
+
 static int write_all(int fd, const char *p, size_t n) {
     while (n) {
         ssize_t w = write(fd, p, n);
@@ -171,11 +191,8 @@ static const char *unix_target;
 
 static void *unix_conn(void *arg) {
     int v = (int)(intptr_t)arg;
-    int u = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    struct sockaddr_un a = {.sun_family = AF_UNIX};
-    snprintf(a.sun_path, sizeof a.sun_path, "%s", unix_target);
-    if (u < 0 || connect(u, (struct sockaddr *)&a, sizeof a)) {
-        if (u >= 0) close(u);
+    int u = connect_unix(unix_target);
+    if (u < 0) {
         close(v);
         return NULL;
     }
@@ -195,17 +212,208 @@ static void *relay_conn(void *arg) {
     return NULL;
 }
 
+/* Where host.docker.internal connections reach the Mac over the VM's network: "<ip> <port> <secret>",
+ * readable by root only (containers never see the guest's /run). */
+#define MAC_FILE "/run/mdock/mac"
+
+static void publish_mac(const char *ip, unsigned port, const char *secret) {
+    mkdir("/run/mdock", 0755);
+    int fd = open(MAC_FILE ".new", O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0) return;
+    char line[128];
+    int n = snprintf(line, sizeof line, "%s %u %s\n", ip, port, secret);
+    int ok = write_all(fd, line, (size_t)n) == 0;
+    close(fd);
+    if (ok) rename(MAC_FILE ".new", MAC_FILE);
+}
+
+/* host.docker.internal over the VM's network: a connection to the Mac that has sent the secret and the
+ * port, or -1 (no dial-back yet, or the Mac's listener is gone: use vsock). */
+static int connect_mac(unsigned port) {
+    char ip[INET_ADDRSTRLEN], secret[65], line[128];
+    unsigned macport;
+    FILE *f = fopen(MAC_FILE, "re");
+    if (!f) return -1;
+    int got = fgets(line, sizeof line, f) && sscanf(line, "%15s %u %64s", ip, &macport, secret) == 3;
+    fclose(f);
+    struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons((uint16_t)macport)};
+    if (!got || inet_pton(AF_INET, ip, &a.sin_addr) != 1) return -1;
+    int m = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (m < 0 || connect(m, (struct sockaddr *)&a, sizeof a)) {
+        if (m >= 0) close(m);
+        return -1;
+    }
+    nodelay(m);
+    int n = snprintf(line, sizeof line, "%s %u\n", secret, port);
+    if (write_all(m, line, (size_t)n)) {
+        close(m);
+        return -1;
+    }
+    return m;
+}
+
+struct dialback {
+    int ctl; /* the Mac's control stream; replies are written whole under `lock` */
+    int refs;
+    pthread_mutex_t lock;
+    struct sockaddr_in mac;
+};
+
+struct dial {
+    struct dialback *db;
+    char id[33];
+    char target[108]; /* a port, or unix:<path> */
+};
+
+static void dialback_release(struct dialback *db) {
+    pthread_mutex_lock(&db->lock);
+    int last = --db->refs == 0;
+    pthread_mutex_unlock(&db->lock);
+    if (last) {
+        close(db->ctl);
+        pthread_mutex_destroy(&db->lock);
+        free(db);
+    }
+}
+
+static void dialback_reply(struct dialback *db, const char *id, const char *what) {
+    char line[64];
+    int n = snprintf(line, sizeof line, "%s %s\n", id, what);
+    pthread_mutex_lock(&db->lock);
+    write_all(db->ctl, line, (size_t)n);
+    pthread_mutex_unlock(&db->lock);
+}
+
+static void *dial_conn(void *arg) {
+    struct dial *d = arg;
+    int t = -1;
+    if (!strncmp(d->target, "unix:", 5)) {
+        t = connect_unix(d->target + 5);
+    } else {
+        char *end;
+        long port = strtol(d->target, &end, 10);
+        if (*end == 0 && port > 0 && port < 65536) t = connect_local((unsigned)port);
+    }
+    int m = t < 0 ? -1 : socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (t < 0) {
+        dialback_reply(d->db, d->id, "refused");
+    } else if (m < 0 || connect(m, (struct sockaddr *)&d->db->mac, sizeof d->db->mac)) {
+        dialback_reply(d->db, d->id, "unreachable");
+    } else {
+        char line[40];
+        int n = snprintf(line, sizeof line, "%s\n", d->id);
+        nodelay(m);
+        if (write_all(m, line, (size_t)n) == 0) {
+            bridge(t, m, 0); /* TCP both sides: half-closes pass through as they are */
+            t = m = -1;
+        }
+    }
+    if (t >= 0) close(t);
+    if (m >= 0) close(m);
+    dialback_release(d->db);
+    free(d);
+    return NULL;
+}
+
+/* Lines from a stream read in chunks: the control stream brings one per connection. */
+struct lines {
+    int fd;
+    size_t len;
+    char buf[1024];
+};
+
+static int next_line(struct lines *l, char *out, size_t size) {
+    for (;;) {
+        char *nl = memchr(l->buf, '\n', l->len);
+        if (nl) {
+            size_t n = (size_t)(nl - l->buf);
+            if (n >= size) return -1;
+            memcpy(out, l->buf, n);
+            out[n] = 0;
+            l->len -= n + 1;
+            memmove(l->buf, nl + 1, l->len);
+            return 0;
+        }
+        if (l->len == sizeof l->buf) return -1;
+        ssize_t r = read(l->fd, l->buf + l->len, sizeof l->buf - l->len);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) return -1;
+        l->len += (size_t)r;
+    }
+}
+
+static void *dialback_conn(void *arg) {
+    struct dialback *db = calloc(1, sizeof *db);
+    if (!db) {
+        close((int)(intptr_t)arg);
+        return NULL;
+    }
+    db->ctl = (int)(intptr_t)arg;
+    db->refs = 1;
+    pthread_mutex_init(&db->lock, NULL);
+    char line[160], ip[INET_ADDRSTRLEN], id[33], target[108], secret[65] = "";
+    unsigned port;
+    struct lines *in = malloc(sizeof *in);
+    if (!in) {
+        dialback_release(db);
+        return NULL;
+    }
+    in->fd = db->ctl;
+    in->len = 0;
+    db->mac.sin_family = AF_INET;
+    if (next_line(in, line, sizeof line) || sscanf(line, "%15s %u %64s", ip, &port, secret) < 2 || !port || port > 65535 ||
+        inet_pton(AF_INET, ip, &db->mac.sin_addr) != 1) {
+        free(in);
+        dialback_release(db);
+        return NULL;
+    }
+    db->mac.sin_port = htons((uint16_t)port);
+    if (secret[0]) publish_mac(ip, port, secret);
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_attr_setstacksize(&attr, 256 * 1024);
+    while (next_line(in, line, sizeof line) == 0) {
+        struct dial *d;
+        if (sscanf(line, "%32s %107s", id, target) != 2 || !(d = malloc(sizeof *d))) continue;
+        d->db = db;
+        snprintf(d->id, sizeof d->id, "%s", id);
+        snprintf(d->target, sizeof d->target, "%s", target);
+        pthread_mutex_lock(&db->lock);
+        db->refs++;
+        pthread_mutex_unlock(&db->lock);
+        pthread_t t;
+        if (pthread_create(&t, &attr, dial_conn, d)) {
+            dialback_release(db);
+            free(d);
+        }
+    }
+    pthread_attr_destroy(&attr);
+    free(in);
+    if (secret[0]) unlink(MAC_FILE); /* the Mac's end is gone */
+    dialback_release(db);
+    return NULL;
+}
+
 static void *hostfwd_conn(void *arg) {
     int t = (int)(intptr_t)arg;
     struct sockaddr_in dst;
     socklen_t len = sizeof dst;
     int v = -1;
-    if (getsockopt(t, SOL_IP, SO_ORIGINAL_DST, &dst, &len) == 0 && (v = connect_vsock_host(hostfwd_vsock_port)) >= 0) {
+    if (getsockopt(t, SOL_IP, SO_ORIGINAL_DST, &dst, &len) == 0) {
+        /* Over the VM's network when dial-back is up (TCP's flow control and half-closes end to end),
+         * else over vsock. */
+        unsigned port = ntohs(dst.sin_port);
+        int tcp = 1;
+        if ((v = connect_mac(port)) < 0) {
+            tcp = 0;
+            v = connect_vsock_host(hostfwd_vsock_port);
+        }
         char line[16];
-        int n = snprintf(line, sizeof line, "%u\n", ntohs(dst.sin_port));
+        int n = snprintf(line, sizeof line, "%u\n", port);
         char ok = 0;
         ssize_t r = -1;
-        if (write_all(v, line, (size_t)n) == 0)
+        if (v >= 0 && (tcp || write_all(v, line, (size_t)n) == 0))
             do r = read(v, &ok, 1); while (r < 0 && errno == EINTR);
         if (r == 1 && ok == 1) {
             nodelay(t);
@@ -351,6 +559,7 @@ static unsigned arg_port(int argc, char **argv, int i, unsigned def) {
 int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
     const char *mode = argc > 1 ? argv[1] : "";
+    if (!strcmp(mode, "dialback")) serve(listen_vsock(arg_port(argc, argv, 2, 2379), 0), dialback_conn);
     /* Uploads into the guest: published ports over vsock, and docker cp, image loads and build
      * contexts through the Docker API. */
     if (!strcmp(mode, "relay")) serve(listen_vsock(arg_port(argc, argv, 2, 2376), 1 << 20), relay_conn);
@@ -365,7 +574,7 @@ int main(int argc, char **argv) {
         unix_target = argv[3];
         serve(listen_vsock(arg_port(argc, argv, 2, 2375), 4 << 20), unix_conn);
     }
-    fprintf(stderr, "usage: mdock-guestd relay|notify|udp [vsock-port] | hostfwd [tcp-port] [vsock-port]"
+    fprintf(stderr, "usage: mdock-guestd dialback|relay|notify|udp [vsock-port] | hostfwd [tcp-port] [vsock-port]"
                     " | unix vsock-port path | tso\n");
     return 2;
 }
