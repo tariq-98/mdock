@@ -96,6 +96,8 @@ enum Paths {
     static let kernelStaging = url("kernel-staging")
     static let machineID = url("machine-id")
     static let console = url("console.log")
+    /// The previous boot's console: after the guest crashed and the VM restarted, the reason is here.
+    static let previousConsole = url("console.log.1")
     static let daemonLog = url("daemon.log")
     static let dockerSocket = url("docker.sock")
     static let controlSocket = url("control.sock")

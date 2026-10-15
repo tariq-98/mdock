@@ -98,7 +98,7 @@ enum Krun {
 
         let memMiB = UInt32(config.memoryGiB * 1024)
         check(fn("krun_set_vm_config", SetVMConfig.self)(id, UInt8(min(config.cpus, 255)), memMiB), "set_vm_config")
-        let cmdline = "root=/dev/vda2 ro rootwait rootfstype=ext4 modules=ext4,virtio_mmio,virtio_blk console=hvc0 quiet init_on_alloc=0 " +
+        let cmdline = "root=/dev/vda2 ro rootwait rootfstype=ext4 modules=ext4,virtio_mmio,virtio_blk console=hvc0 quiet init_on_alloc=0 panic=10 " +
             "rcupdate.rcu_expedited=1 rcutree.jiffies_till_first_fqs=0 rcutree.jiffies_till_next_fqs=1 mdock.engine=krun"
         let initrd = FileManager.default.fileExists(atPath: Paths.kernelMountsRoot.path) ? nil : Paths.initrd.path
         check(fn("krun_set_kernel", SetKernel.self)(id, Paths.kernel.path, kernelFormatRaw, initrd, cmdline), "set_kernel")

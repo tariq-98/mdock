@@ -110,7 +110,9 @@ final class Daemon: NSObject, VZVirtualMachineDelegate, VZVirtioSocketListenerDe
         // (init_on_free=1 is no better: it zeroes all of memory at boot.)
         // rcu_expedited and quick force-quiescent-state scans: shorter RCU grace periods, which network
         // namespace setup and teardown wait on at every container start and stop.
-        loader.commandLine = "root=/dev/vda2 ro rootwait rootfstype=ext4 modules=ext4 console=hvc0 quiet init_on_alloc=0 " +
+        // panic=10: a guest kernel that panics reboots, which stops the VM; launchd then starts mdock
+        // again (exit status 75) instead of the VM hanging until the watchdog gives up on it.
+        loader.commandLine = "root=/dev/vda2 ro rootwait rootfstype=ext4 modules=ext4 console=hvc0 quiet init_on_alloc=0 panic=10 " +
             "rcupdate.rcu_expedited=1 rcutree.jiffies_till_first_fqs=0 rcutree.jiffies_till_next_fqs=1"
         vz.bootLoader = loader
 
@@ -203,6 +205,8 @@ final class Daemon: NSObject, VZVirtualMachineDelegate, VZVirtioSocketListenerDe
         }
         Sync.resume()
         try "\(getpid())\n".write(to: Paths.pid, atomically: true, encoding: .utf8)
+        try? FileManager.default.removeItem(at: Paths.previousConsole)
+        try? FileManager.default.moveItem(at: Paths.console, to: Paths.previousConsole)
         if config.gpu {
             try runKrun()
             return
