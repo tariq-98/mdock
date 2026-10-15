@@ -33,14 +33,15 @@ final class UDPForward {
 
     private func receiveLoop() {
         var buffer = [UInt8](repeating: 0, count: 2 + 65_535)
-        var pfd = pollfd(fd: listener, events: Int16(POLLIN), revents: 0)
+        var pfds = [pollfd(fd: listener, events: Int16(POLLIN), revents: 0),
+                    pollfd(fd: cancel.readable, events: Int16(POLLIN), revents: 0)]
         var lastSweep = Date()
         while !cancel.isSet {
             if Date().timeIntervalSince(lastSweep) > 30 {
                 sweep(idleFor: 120)
                 lastSweep = Date()
             }
-            guard poll(&pfd, 1, 250) > 0 else { continue }
+            guard poll(&pfds, 2, 30_000) > 0, pfds[0].revents != 0 else { continue }
             var addr = sockaddr_storage()
             var len = socklen_t(MemoryLayout<sockaddr_storage>.size)
             let n = buffer.withUnsafeMutableBytes { raw in

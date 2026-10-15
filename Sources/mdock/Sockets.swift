@@ -135,8 +135,44 @@ final class ByteQueue {
 final class Cancel {
     private let lock = NSLock()
     private var value = false
+    private var wake: (read: Int32, write: Int32)?
     var isSet: Bool { lock.withLock { value } }
-    func set() { lock.withLock { value = true } }
+
+    func set() {
+        let fd = lock.withLock { () -> Int32? in
+            guard !value else { return nil }
+            value = true
+            return wake?.write
+        }
+        if let fd {
+            var byte: UInt8 = 1
+            _ = write(fd, &byte, 1)
+        }
+    }
+
+    /// A descriptor that becomes readable once set: a poll loop waits on it beside its own, instead of
+    /// waking up every so often to check (each wake-up costs the Mac a little energy).
+    var readable: Int32 {
+        lock.withLock {
+            if let wake { return wake.read }
+            var fds: [Int32] = [-1, -1]
+            guard pipe(&fds) == 0 else { return -1 }
+            for fd in fds { _ = fcntl(fd, F_SETFD, FD_CLOEXEC) }
+            if value {
+                var byte: UInt8 = 1
+                _ = write(fds[1], &byte, 1)
+            }
+            wake = (fds[0], fds[1])
+            return fds[0]
+        }
+    }
+
+    deinit {
+        if let wake {
+            close(wake.read)
+            close(wake.write)
+        }
+    }
 }
 
 enum Sockets {
@@ -356,10 +392,10 @@ enum Sockets {
     static func acceptLoop(_ fd: Int32, cancel: Cancel = Cancel(), handler: @escaping (Int32) -> Void) {
         Thread.detachNewThread {
             defer { close(fd) }
-            var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+            var pfds = [pollfd(fd: fd, events: Int16(POLLIN), revents: 0),
+                        pollfd(fd: cancel.readable, events: Int16(POLLIN), revents: 0)]
             while !cancel.isSet {
-                let ready = poll(&pfd, 1, 250)
-                if ready <= 0 { continue }
+                guard poll(&pfds, 2, -1) > 0, pfds[1].revents == 0 else { continue }
                 let client = accept(fd, nil, nil)
                 if client < 0 {
                     if errno == EINTR || errno == ECONNABORTED || errno == EAGAIN { continue }
