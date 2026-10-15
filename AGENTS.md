@@ -113,6 +113,11 @@ Rules learned the hard way:
 - Under FEX, Go's asynchronous preemption (SIGURG) crashes Go programs; FEX's patch adds
   `GODEBUG=asyncpreemptoff=1` to what it runs. FEX's own code cache is experimental and needs
   FEXServer; a cache shared between containers would let one poison another's code, so there is none.
+- Nothing may poll the Docker API on a timer: each listing wakes dockerd and containerd across every
+  vCPU (2 s polling from the menu bar app tripled the idle VM's CPU), and calls on `docker.sock` count
+  as activity, so a poller keeps the VM from ever stopping when idle. Follow `/events`, and use
+  `~/.mdock/internal.sock` for anything that isn't the user's own command. Measure idle cost with
+  `top -l 2 -s 30 -stats pid,command,cpu,power` on the VM process (com.apple.Virtualization.VirtualMachine).
 - After changing the desktop app, launch it (`open ~/Applications/"mdock Desktop.app"`); building
   doesn't catch a crash at launch. SwiftUI creates the app's model before `NSApp` exists, so code
   reached from `Model.init` must not assume it. Such a crash exits with status 133 and leaves no

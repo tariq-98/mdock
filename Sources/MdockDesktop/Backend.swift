@@ -5,6 +5,8 @@ enum Backend {
     static let state = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".mdock")
     static let controlSocket = state.appendingPathComponent("control.sock").path
     static let dockerSocket = state.appendingPathComponent("docker.sock").path
+    /// The same Docker API, not counted as a docker client for idle stop; it exists only while the VM runs.
+    static let internalSocket = state.appendingPathComponent("internal.sock").path
     static let configFile = state.appendingPathComponent("config.json")
     static let idleMarker = state.appendingPathComponent("idle-stopped").path
 
@@ -83,18 +85,34 @@ enum Backend {
         var body: Data
     }
 
-    static func docker(_ method: String, _ path: String) -> HTTPResponse? {
+    static func docker(_ method: String, _ path: String, socket: String = dockerSocket) -> HTTPResponse? {
         let request = "\(method) \(path) HTTP/1.0\r\nHost: docker\r\nContent-Length: 0\r\n\r\n"
-        guard let raw = exchange(dockerSocket, Data(request.utf8)),
+        guard let raw = exchange(socket, Data(request.utf8)),
               let split = raw.range(of: Data("\r\n\r\n".utf8)) else { return nil }
         let head = String(decoding: raw[..<split.lowerBound], as: UTF8.self)
         let code = head.split(separator: " ").dropFirst().first.flatMap { Int($0) } ?? 0
         return HTTPResponse(status: code, body: raw[split.upperBound...])
     }
 
-    static func dockerJSON<T: Decodable>(_ path: String, as: T.Type) -> T? {
-        guard let response = docker("GET", path), response.status == 200 else { return nil }
+    static func dockerJSON<T: Decodable>(_ path: String, as: T.Type, socket: String = dockerSocket) -> T? {
+        guard let response = docker("GET", path, socket: socket), response.status == 200 else { return nil }
         return try? JSONDecoder().decode(T.self, from: response.body)
+    }
+
+    /// Calls `changed` for each piece of Docker's event stream that can change what the app lists
+    /// (containers created, started, stopped, removed; images pulled, tagged, removed), until the
+    /// stream ends. The stream is silent, and costs nothing, while nothing happens.
+    static func watchEvents(_ changed: () -> Void) {
+        guard let fd = connect(internalSocket) else { return }
+        defer { close(fd) }
+        var forever = timeval()
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &forever, socklen_t(MemoryLayout<timeval>.size))
+        let filters = #"{"type":["container","image"],"event":["create","destroy","die","start","stop","pause","unpause","rename","health_status","pull","delete","tag","untag","import","load"]}"#
+        let query = filters.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? ""
+        let request = Data("GET /events?filters=\(query) HTTP/1.0\r\nHost: docker\r\n\r\n".utf8)
+        guard request.withUnsafeBytes({ write(fd, $0.baseAddress, request.count) }) == request.count else { return }
+        var buffer = [UInt8](repeating: 0, count: 65536)
+        while read(fd, &buffer, buffer.count) > 0 { changed() }
     }
 
     /// Container logs; non-TTY streams are multiplexed with 8-byte frame headers.

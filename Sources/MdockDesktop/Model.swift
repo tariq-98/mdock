@@ -19,7 +19,9 @@ final class Model {
     /// Stopped by idle stop, with launchd waiting to start it again on the next docker command.
     var idleStopped = false
 
-    var running: Bool { status?.ready == true }
+    /// Docker is ready. Kept apart from `status`, which is only refreshed while a window is on screen:
+    /// the menu bar icon needs nothing else.
+    private(set) var running = false
     var configuredGPU: Bool { config["gpuEngine"] as? Bool ?? false }
     var idleMinutes: Int { config["idleMinutes"] as? Int ?? 10 }
     var runningContainers: [Container] { containers.filter(\.running) }
@@ -69,37 +71,78 @@ final class Model {
     }
 
     private var timer: Timer?
+    /// Docker's event stream is being read (Backend.watchEvents).
+    private var watching = false
+    private var reloadPending = false
+    /// When containers and images were last read.
+    private var loadedAt = Date.distantPast
+    private var ticks = 0
 
     init() {
-        refresh()
+        Task { await reload() }
         timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refresh() }
         }
     }
 
+    /// Every 2 s the daemon's status, from its control socket: Docker isn't involved. Containers and
+    /// images are read again only when Docker reports a change (and every 30 s while a window is on
+    /// screen, for "Up 5 minutes"). Listing them every 2 s kept dockerd and containerd waking each
+    /// other across every vCPU, which tripled mdock's idle CPU use.
     func refresh() {
-        // Containers and images only while a window is open: listing them every 2 s keeps dockerd and
-        // containerd waking each other across every vCPU, which costs the Mac real CPU when idle.
         // NSApp is still nil when SwiftUI creates the model at launch: no window is open yet.
-        let visible = NSApp?.windows.contains { $0.isVisible && !String(describing: type(of: $0)).contains("StatusBar") } ?? false
-        if !visible && !containers.isEmpty && status != nil {
-            Task.detached(priority: .utility) {
-                let status = Backend.status()
-                let idle = status == nil && Backend.idleStopped
-                await MainActor.run {
-                    self.status = status
-                    self.idleStopped = idle
-                }
+        let onScreen = NSApp?.windows.contains {
+            $0.isVisible && $0.occlusionState.contains(.visible) && !String(describing: type(of: $0)).contains("StatusBar")
+        } ?? false
+        if onScreen && Date().timeIntervalSince(loadedAt) > 30 { scheduleReload() }
+        // Off screen, only the menu bar icon shows the state: every 10 s is enough (this app's own
+        // starts and stops update at once).
+        ticks += 1
+        guard onScreen || ticks % 5 == 0 else { return }
+        Task.detached(priority: .utility) {
+            let status = Backend.status()
+            let idle = status == nil && Backend.idleStopped
+            await MainActor.run {
+                let ready = status?.ready == true
+                let started = ready && !self.running
+                // Off screen, only what the menu bar icon shows changes: a new status every 2 s had SwiftUI
+                // lay out windows nobody was looking at.
+                if onScreen || ready != self.running { self.status = status }
+                if ready != self.running { self.running = ready }
+                if idle != self.idleStopped { self.idleStopped = idle }
+                if started { self.scheduleReload() }
+                if ready { self.watchEvents() }
             }
-            return
         }
-        Task { await reload() }
+    }
+
+    /// Reads Docker's events until the stream ends (the VM stopped); the timer starts it again.
+    private func watchEvents() {
+        guard !watching else { return }
+        watching = true
+        Thread.detachNewThread { [weak self] in
+            Backend.watchEvents { Task { @MainActor in self?.scheduleReload() } }
+            Task { @MainActor in self?.watching = false }
+        }
+    }
+
+    /// One reload for a burst of events (a compose project starting, say).
+    private func scheduleReload() {
+        guard !reloadPending else { return }
+        reloadPending = true
+        Task {
+            try? await Task.sleep(for: .milliseconds(300))
+            reloadPending = false
+            await reload()
+        }
     }
 
     /// Everything the windows show, read off the main thread.
     func reload() async {
+        loadedAt = Date()
         let snapshot = await Task.detached(priority: .utility) { Snapshot.load() }.value
         status = snapshot.status
+        running = snapshot.status?.ready == true
         containers = snapshot.containers.sorted { $0.Created > $1.Created }
         images = snapshot.images.sorted { $0.Created > $1.Created }
         gpuContainers = snapshot.gpuContainers
@@ -199,10 +242,13 @@ struct Snapshot: Sendable {
     static func load() -> Snapshot {
         let status = Backend.status()
         guard status?.ready == true else { return Snapshot(status: status, idleStopped: status == nil && Backend.idleStopped) }
-        let containers = Backend.dockerJSON("/containers/json?all=1", as: [Container].self) ?? []
-        let images = Backend.dockerJSON("/images/json", as: [DockerImage].self) ?? []
+        // mdock's internal socket: looking at the app doesn't count as using Docker, so it never keeps
+        // the VM from stopping when idle.
+        let socket = Backend.internalSocket
+        let containers = Backend.dockerJSON("/containers/json?all=1", as: [Container].self, socket: socket) ?? []
+        let images = Backend.dockerJSON("/images/json", as: [DockerImage].self, socket: socket) ?? []
         let gpu = Set(containers.filter(\.running).filter {
-            Backend.dockerJSON("/containers/\($0.Id)/json", as: ContainerDetail.self)?.usesGPU == true
+            Backend.dockerJSON("/containers/\($0.Id)/json", as: ContainerDetail.self, socket: socket)?.usesGPU == true
         }.map(\.Id))
         return Snapshot(status: status, containers: containers, images: images, gpuContainers: gpu)
     }
