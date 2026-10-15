@@ -37,6 +37,9 @@ Usage (also as `docker mdock …`):
                          ahead-of-time cache; off: it breaks some programs), ports, balloon, sync,
                          idle (minutes with nothing running before the VM stops; 0 = never)
   mdock shell            Root shell in the VM
+  mdock debug CONTAINER [IMAGE]
+                         Shell beside a running container, even one with no shell (distroless): its
+                         network and processes, its files at /proc/1/root, IMAGE's tools (alpine)
   mdock logs [console]   Follow the daemon log (or the guest console)
   mdock delete           Stop and remove the VM and all its images and volumes
   mdock <docker command> Anything else runs as `docker --context mdock …` (mdock ps, mdock run …)
@@ -509,6 +512,14 @@ do {
     case "shell":
         execDocker(["run", "--rm", "-it", "--privileged", "--pid=host", "--net=host", "alpine",
                     "nsenter", "-t", "1", "-m", "-u", "-n", "-i", "-p", "sh", "-l"])
+    case "debug":
+        guard args.count == 2 || args.count == 3 else { throw CommandError(description: "usage: mdock debug CONTAINER [IMAGE]") }
+        // A throwaway container in the target's network and process namespaces with IMAGE's tools
+        // (`apk add` for more); the target itself is left as it is. Its files are at /proc/1/root,
+        // where the shell starts (runc refuses that as the starting directory itself).
+        execDocker(["run", "--rm", "-it", "--network", "container:\(args[1])", "--pid", "container:\(args[1])",
+                    "--cap-add", "SYS_PTRACE", args.count == 3 ? args[2] : "alpine:3.22",
+                    "sh", "-c", "cd /proc/1/root 2>/dev/null; exec sh"])
     case "logs" where args.count == 1 || ["console", "daemon"].contains(args[1]):
         follow(args.count > 1 && args[1] == "console" ? Paths.console : Paths.daemonLog)
     case "kubernetes", "k8s": try Kubernetes.command(Array(args.dropFirst()))

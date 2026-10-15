@@ -29,6 +29,8 @@ Engine from containers. One VM is shared by everything on the Mac, including lon
 - **Network**: published ports (TCP and UDP), `--network host` listeners and Kubernetes LoadBalancers
   appear on the Mac's localhost. Inside containers, `host.docker.internal` (and `--add-host
   x:host-gateway`) is the Mac's own localhost, IPv4 and IPv6.
+- **A shell in any container**, even one without a shell (distroless): `mdock debug CONTAINER
+  [IMAGE]` starts IMAGE (alpine) in its network and process namespaces, in its files (/proc/1/root).
 - **Idle stop**: under autostart the VM shuts down after `idle` minutes (default 10) with no
   containers and no docker clients; any docker command starts it again and waits (~3.5 s). `mdock
   status` then says "stopped after being idle": that's normal, not a failure. `mdock set idle=0`

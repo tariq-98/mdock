@@ -223,6 +223,7 @@ Desktop's helper did, for tools that only look there.
 | `mdock gpu-check` | Show what GPU APIs a container gets (GPU engine) |
 | `mdock mcp` | MCP server on stdio, for AI agents |
 | `mdock shell` | Root shell inside the VM |
+| `mdock debug CONTAINER [IMAGE]` | Shell beside a running container, even a distroless one: its network, processes and files, with Alpine's tools |
 | `mdock logs [console]` | Follow mdock's log, or the VM's console |
 | `mdock delete` | Delete the VM with all its images, containers and volumes |
 
