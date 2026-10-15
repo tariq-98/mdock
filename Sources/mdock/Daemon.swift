@@ -69,6 +69,8 @@ final class Daemon: NSObject, VZVirtualMachineDelegate, VZVirtioSocketListenerDe
     /// Running containers other than mdock's own (the sync container); -1 until first counted.
     private var busyContainers = -1
     private var idleStopped = false
+    /// The container that last kept the VM from an idle stop (logged once per container).
+    private var idleVeto: String?
 
     /// Published ports normally go straight to the guest's IP over vmnet. A daemon started by launchd
     /// counts as its own app for macOS's Local Network privacy check, which blocks connections into
@@ -703,7 +705,31 @@ final class Daemon: NSObject, VZVirtualMachineDelegate, VZVirtioSocketListenerDe
         guard candidate, minutes > 0, quietFor >= UInt64(minutes) * 60_000_000_000, let running = dockerGET("/containers/json") as? [[String: Any]] else { return false }
         let busy = userContainers(running)
         stateLock.withLock { busyContainers = busy }
-        return busy == 0
+        guard busy == 0 else { return false }
+        if let name = restartedOnBoot() {
+            if stateLock.withLock({ () -> Bool in defer { idleVeto = name }; return idleVeto != name }) {
+                log("not stopping while idle: Docker would start \(name) again when the VM boots (its restart policy)")
+            }
+            return false
+        }
+        return true
+    }
+
+    /// A stopped container Docker would start again when the VM boots: restart policy `always`, or
+    /// `on-failure` after an error exit. Stopping the VM while idle would bring back a container
+    /// someone stopped, so idle stop waits.
+    private func restartedOnBoot() -> String? {
+        // filters={"status":["exited"]}
+        guard let stopped = dockerGET("/containers/json?all=1&filters=%7B%22status%22%3A%5B%22exited%22%5D%7D") as? [[String: Any]] else { return nil }
+        for container in stopped where (container["Labels"] as? [String: Any])?["com.mdock.internal"] == nil {
+            guard let id = container["Id"] as? String, let detail = dockerGET("/containers/\(id)/json") as? [String: Any],
+                  let policy = ((detail["HostConfig"] as? [String: Any])?["RestartPolicy"] as? [String: Any])?["Name"] as? String else { continue }
+            let exitCode = (detail["State"] as? [String: Any])?["ExitCode"] as? Int ?? 0
+            if policy == "always" || (policy == "on-failure" && exitCode != 0) {
+                return (container["Names"] as? [String])?.first.map { String($0.dropFirst()) } ?? String(id.prefix(12))
+            }
+        }
+        return nil
     }
 
     private func idleMinutes() -> Int { (try? loadConfig())?.idle ?? config.idle }
