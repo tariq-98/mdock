@@ -4,7 +4,10 @@ set -e
 cd "$(dirname "$0")"
 swift build -c release --product mdock
 swift build -c release --product MdockDesktop
-codesign --force --sign - --entitlements mdock.entitlements .build/release/mdock
+# A fixed identifier and designated requirement: still an ad-hoc signature, but one macOS recognises
+# as the same program after every rebuild, so permissions it grants mdock (Local Network) stick.
+codesign --force --sign - --identifier dev.mdock.cli -r='designated => identifier "dev.mdock.cli"' \
+  --entitlements mdock.entitlements .build/release/mdock
 echo "built .build/release/mdock"
 # `mdock` on PATH (~/.local/bin is ahead of /usr/local/bin), and as the `docker mdock` CLI plugin;
 # symlinks follow rebuilds.

@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Embedded in the mdock binary (__TEXT,__info_plist): with the fixed signing identifier (build.sh),
+     macOS knows mdock by one name across rebuilds, in privacy prompts and in what it has allowed (such
+     as files in Desktop or Documents shared into the VM). -->
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key><string>dev.mdock.cli</string>
+    <key>CFBundleName</key><string>mdock</string>
+    <key>CFBundleDisplayName</key><string>mdock</string>
+    <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+</dict>
+</plist>

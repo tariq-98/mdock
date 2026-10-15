@@ -87,8 +87,10 @@ for f in "$LIB"/*.dylib "$APP/Contents/MacOS/gpu/bin/gvproxy" "$MEDIA"/lib/*.dyl
          "$APP"/Contents/MacOS/mdock-* "$APP"/Contents/MacOS/llama-server "$APP"/Contents/MacOS/ggml-rpc-server; do
   codesign --force --sign - "$f"
 done
-codesign --force --sign - --entitlements mdock.entitlements "$APP/Contents/MacOS/mdock"
-codesign --force --sign - "$APP"
+# The same fixed identities as build.sh, so macOS keeps permissions granted to them across rebuilds.
+codesign --force --sign - --identifier dev.mdock.cli -r='designated => identifier "dev.mdock.cli"' \
+  --entitlements mdock.entitlements "$APP/Contents/MacOS/mdock"
+codesign --force --sign - -r='designated => identifier "dev.mdock.desktop"' "$APP"
 
 mkdir -p "$HOME/Applications"
 rm -rf "$HOME/Applications/mdock Desktop.app"
