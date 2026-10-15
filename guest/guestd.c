@@ -24,6 +24,12 @@
 //   mdock-guestd clock   [vsock-port]             The Mac's time (2380), "<seconds>.<nanoseconds>\n" after
 //                                                 the Mac sleeps (the VM's clock stops meanwhile): steps
 //                                                 the clock when it is more than a second off.
+//   mdock-guestd report  [seconds]                The guest's memory to the Mac (1024) every 5 s: "mem
+//                                                 <total KiB> <available KiB> <ballooned KiB>".
+//   mdock-guestd listeners script                 Runs script whenever the VM's listening sockets change,
+//                                                 checked every second without starting a process (the
+//                                                 script, mdock-agent's host-network port report, reads
+//                                                 every process's descriptors).
 //   mdock-guestd tso                              Exit status 0 if this kernel can run a thread in x86's
 //                                                 memory order (Apple silicon TSO through
 //                                                 PR_SET_MEM_MODEL, mdock's kernel): it tries on itself.
@@ -53,10 +59,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <spawn.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -587,6 +595,105 @@ static void serve(int listener, void *(*handler)(void *)) {
     }
 }
 
+/* A /proc file's contents, NUL-terminated, in a buffer the caller frees; NULL on failure. */
+static char *slurp(const char *path) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return NULL;
+    size_t cap = 65536, len = 0;
+    char *buf = malloc(cap);
+    for (;;) {
+        if (!buf) break;
+        if (len + 1 == cap) {
+            char *bigger = realloc(buf, cap *= 2);
+            if (!bigger) {
+                free(buf);
+                buf = NULL;
+                break;
+            }
+            buf = bigger;
+        }
+        ssize_t r = read(fd, buf + len, cap - 1 - len);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) break;
+        len += (size_t)r;
+    }
+    close(fd);
+    if (buf) buf[len] = 0;
+    return buf;
+}
+
+static long field(const char *text, const char *name) {
+    const char *at = text ? strstr(text, name) : NULL;
+    return at ? strtol(at + strlen(name), NULL, 10) : 0;
+}
+
+static void report(unsigned seconds) {
+    long page = sysconf(_SC_PAGESIZE) / 1024;
+    for (;;) {
+        char *meminfo = slurp("/proc/meminfo"), *vmstat = slurp("/proc/vmstat");
+        char line[96];
+        int n = snprintf(line, sizeof line, "mem %ld %ld %ld\n", field(meminfo, "MemTotal:"), field(meminfo, "MemAvailable:"),
+                         field(vmstat, "\nnr_balloon_pages ") * page);
+        free(meminfo);
+        free(vmstat);
+        int v = connect_vsock_host(1024);
+        if (v >= 0) {
+            write_all(v, line, (size_t)n);
+            close(v);
+        }
+        sleep(seconds);
+    }
+}
+
+/* The local address of every listening socket (TCP state 0A; UDP 07, unbound to a peer), file by file. */
+static char *listening(void) {
+    static const char *files[] = {"/proc/net/tcp", "/proc/net/tcp6", "/proc/net/udp", "/proc/net/udp6"};
+    size_t cap = 4096, len = 0;
+    char *out = malloc(cap);
+    if (!out) return NULL;
+    out[0] = 0;
+    for (size_t f = 0; f < sizeof files / sizeof *files; f++) {
+        char *text = slurp(files[f]);
+        for (char *line = text ? strchr(text, '\n') : NULL; line && *++line;) { /* the header line is skipped */
+            char local[64], remote[64], state[8];
+            char *next = strchr(line, '\n');
+            if (sscanf(line, "%*s %63s %63s %7s", local, remote, state) == 3 &&
+                (!strcmp(state, f < 2 ? "0A" : "07"))) {
+                size_t need = len + strlen(local) + 4;
+                if (need > cap) {
+                    char *bigger = realloc(out, cap = need * 2);
+                    if (!bigger) break;
+                    out = bigger;
+                }
+                len += (size_t)sprintf(out + len, "%zu %s\n", f, local);
+            }
+            line = next;
+            if (!line) break;
+        }
+        free(text);
+    }
+    return out;
+}
+
+static void listeners(const char *script) {
+    extern char **environ;
+    char *last = NULL;
+    for (;;) {
+        char *now = listening();
+        if (now && (!last || strcmp(now, last))) {
+            free(last);
+            last = now;
+            char *argv[] = {"sh", (char *)script, NULL};
+            pid_t pid;
+            if (posix_spawn(&pid, "/bin/sh", NULL, NULL, argv, environ) == 0)
+                while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
+        } else {
+            free(now);
+        }
+        sleep(1);
+    }
+}
+
 static unsigned arg_port(int argc, char **argv, int i, unsigned def) {
     return argc > i ? (unsigned)strtoul(argv[i], NULL, 10) : def;
 }
@@ -606,11 +713,14 @@ int main(int argc, char **argv) {
     if (!strcmp(mode, "clock")) serve(listen_vsock(arg_port(argc, argv, 2, 2380), 0), clock_conn);
     if (!strcmp(mode, "udp")) serve(listen_vsock(arg_port(argc, argv, 2, 2378), 1 << 20), udp_conn);
     if (!strcmp(mode, "tso")) return prctl(0x4d4d444c /* PR_SET_MEM_MODEL */, 1 /* _TSO */, 0, 0, 0) ? 1 : 0;
+    if (!strcmp(mode, "report")) report(argc > 2 ? (unsigned)strtoul(argv[2], NULL, 10) : 5);
+    if (!strcmp(mode, "listeners") && argc > 2) listeners(argv[2]);
     if (!strcmp(mode, "unix") && argc > 3) {
         unix_target = argv[3];
         serve(listen_vsock(arg_port(argc, argv, 2, 2375), 4 << 20), unix_conn);
     }
     fprintf(stderr, "usage: mdock-guestd dialback|relay|notify|udp|clock [vsock-port] | hostfwd [tcp-port] [vsock-port]"
+                    " | report [seconds] | listeners script"
                     " | unix vsock-port path | tso\n");
     return 2;
 }

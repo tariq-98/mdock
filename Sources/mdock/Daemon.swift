@@ -112,7 +112,10 @@ final class Daemon: NSObject, VZVirtualMachineDelegate, VZVirtioSocketListenerDe
         // namespace setup and teardown wait on at every container start and stop.
         // panic=10: a guest kernel that panics reboots, which stops the VM; launchd then starts mdock
         // again (exit status 75) instead of the VM hanging until the watchdog gives up on it.
+        // kfence.sample_interval=0: Alpine's kernel samples allocations for a memory-error detector ten
+        // times a second, waking a vCPU each time; mdock isn't debugging the kernel.
         loader.commandLine = "root=/dev/vda2 ro rootwait rootfstype=ext4 modules=ext4 console=hvc0 quiet init_on_alloc=0 panic=10 " +
+            "kfence.sample_interval=0 " +
             "rcupdate.rcu_expedited=1 rcutree.jiffies_till_first_fqs=0 rcutree.jiffies_till_next_fqs=1"
         vz.bootLoader = loader
 

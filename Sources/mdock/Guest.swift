@@ -331,7 +331,7 @@ enum Guest {
         done ) &
     fi
 
-    # Kubernetes (mdock kubernetes enable): state, k3s version and LoadBalancer ports, every 10 s.
+    # Kubernetes (mdock kubernetes enable): state, k3s version and LoadBalancer ports, checked every 10 s.
     k8s_report() {
       if [ ! -e /etc/runlevels/default/k3s ]; then echo off; return; fi
       rc-service -q k3s status 2>/dev/null || { echo down; return; }
@@ -341,42 +341,35 @@ enum Guest {
       echo "up ${k3sver:--} $lb"
     }
 
-    # Listeners of host-network containers (--network host, hostNetwork pods): in the VM's own network
-    # namespace and in a container's cgroup. "proto:port:all|lo", for the Mac's localhost.
-    host_ports() {
-      netstat -lntu -p 2>/dev/null | awk 'NR > 2 { print $1, $4, $NF }' | while read -r proto local prog; do
-        pid=${prog%%/*}
-        case "$pid" in ''|*[!0-9]*) continue ;; esac
-        grep -qE '^0::/(docker|kubepods)/' /proc/$pid/cgroup 2>/dev/null || continue
-        case "${local%:*}" in 127.0.0.1|::1) scope=lo ;; *) scope=all ;; esac
-        echo "${proto%6}:${local##*:}:$scope"
-      done | sort -u | tr '\n' ' '
-    }
-    # Every second, so a new --network host listener shows up on the Mac almost at once.
-    (
-      last=""
-      while true; do
-        hp=$(host_ports)
-        [ "$hp" != "$last" ] && notify "hostnet $hp" && last="$hp"
-        sleep 1
-      done
-    ) &
+    # Host-network listeners (mdock-hostports) whenever the VM's listening sockets change, and the guest's
+    # memory every 5 s for the balloon: mdock-guestd checks both without starting a process (the shell
+    # loops these replace started three or four a second, ~1% of a core on an idle VM).
+    if [ -x $guestd ]; then
+      $guestd listeners /usr/local/libexec/mdock/hostports &
+      $guestd report 5 &
+    else
+      ( while true; do sh /usr/local/libexec/mdock/hostports; sleep 1; done ) &
+    fi
 
+    # Every 10 s: Kubernetes' state when it changes, rosettad's health; new GPU and media devices every 30 s.
     n=0
+    k8s=off
     while true; do
-      sleep 5
+      sleep 10
       n=$((n + 1))
       if [ -n "$rosettad_pid" ] && ! kill -0 "$rosettad_pid" 2>/dev/null; then
         logger -t mdock-agent "rosettad exited (a translation failed); restarting it"
         rosettad_start
       fi
-      if [ $((n % 2)) -eq 0 ]; then
+      if [ -e /etc/runlevels/default/k3s ] || [ "$k8s" != off ]; then
         [ -n "$k3sver" ] || [ ! -e /etc/runlevels/default/k3s ] || k3sver=$(k3s --version 2>/dev/null | awk 'NR==1{print $3}')
-        notify "k8s $(k8s_report)"
+        now=$(k8s_report)
+        [ "$now" != "$k8s" ] && notify "k8s $now" && k8s=$now
       fi
-      [ $((n % 6)) -eq 0 ] && /usr/local/sbin/mdock-cdi
-      # The balloon has DEFLATE_ON_OOM, so MemTotal never shrinks; report ballooned KiB separately.
-      notify "$(awk -v ps="$(getconf PAGESIZE)" '/^MemTotal:/{t=$2} /^MemAvailable:/{a=$2} /^nr_balloon_pages /{b=$2*ps/1024} END{print "mem", t, a, b+0}' /proc/meminfo /proc/vmstat)"
+      [ $((n % 3)) -eq 0 ] && /usr/local/sbin/mdock-cdi
+      # Without mdock-guestd: the balloon has DEFLATE_ON_OOM, so MemTotal never shrinks; report ballooned
+      # KiB separately.
+      [ -x $guestd ] || notify "$(awk -v ps="$(getconf PAGESIZE)" '/^MemTotal:/{t=$2} /^MemAvailable:/{a=$2} /^nr_balloon_pages /{b=$2*ps/1024} END{print "mem", t, a, b+0}' /proc/meminfo /proc/vmstat)"
     done
     """#
 
@@ -481,6 +474,24 @@ enum Guest {
     /// Docker's default runtime in mdock: runc, plus Rosetta's cache socket in every container
     /// (Rosetta looks for /run/rosettad/rosetta.sock inside the container's own filesystem). The socket's
     /// directory is mounted rather than the socket, so a restarted rosettad stays reachable.
+    /// Reports the listeners of host-network containers (--network host, hostNetwork pods) to the Mac:
+    /// sockets in the VM's own network namespace held by a process in a container's cgroup, as
+    /// "proto:port:all|lo" for the Mac's localhost. mdock-guestd runs it when the listening sockets change.
+    static let hostPortsScript = #"""
+    #!/bin/sh
+    ports=$(netstat -lntu -p 2>/dev/null | awk 'NR > 2 { print $1, $4, $NF }' | while read -r proto local prog; do
+      pid=${prog%%/*}
+      case "$pid" in ''|*[!0-9]*) continue ;; esac
+      grep -qE '^0::/(docker|kubepods)/' /proc/$pid/cgroup 2>/dev/null || continue
+      case "${local%:*}" in 127.0.0.1|::1) scope=lo ;; *) scope=all ;; esac
+      echo "${proto%6}:${local##*:}:$scope"
+    done | sort -u | tr '\n' ' ')
+    [ "$ports" = "$(cat /run/mdock/hostnet 2>/dev/null)" ] && exit 0
+    mkdir -p /run/mdock
+    echo "$ports" > /run/mdock/hostnet
+    echo "hostnet $ports" | socat -u - VSOCK-CONNECT:2:1024 2>/dev/null
+    """#
+
     static let runcWrapper = #"""
     #!/bin/sh
     case " $* " in
@@ -555,6 +566,8 @@ enum Guest {
     # No background compaction: Virtualization.framework keeps every page the guest touches charged
     # to the Mac, so moving pages around for nothing only grows the VM's footprint.
     vm.compaction_proactiveness = 0
+    # Per-CPU memory counters folded in every 10 s instead of every second: fewer wake-ups of idle vCPUs.
+    vm.stat_interval = 10
     """#
 
     /// (seed file name, install path, mode, content)
@@ -567,6 +580,7 @@ enum Guest {
             ("mdock-relay", "/usr/local/sbin/mdock-relay", "0755", relayScript),
             ("mdock-cdi", "/usr/local/sbin/mdock-cdi", "0755", cdiScript),
             ("mdock-runc", "/usr/local/sbin/mdock-runc", "0755", runcWrapper),
+            ("mdock-hostports", "/usr/local/libexec/mdock/hostports", "0755", hostPortsScript),
             ("accel-dir", "/etc/mdock/accel-dir", "0644", Accel.dir.path + "\n"),
             ("shares-host", "/etc/mdock/shares-host", "0644",
              config.shares.map { "\($0.tag)=\($0.host)" }.joined(separator: ",") + "\n"),
