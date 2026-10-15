@@ -30,10 +30,22 @@ docker run --rm --platform linux/arm64 -v "$PWD":/k -v mdock-kernel-build:/build
   gpg -q --auto-key-locate clear,wkd --locate-keys gregkh@kernel.org >/dev/null
   xz -dc /k/src/linux-$VER.tar.xz | gpg --status-fd 1 --verify /k/src/linux-$VER.tar.sign - 2>/dev/null \
     | grep -q 'VALIDSIG .*$SIGNER'
-  # Fresh source with the release's timestamps; patched files are newer than the kept objects.
+  # Fresh source with the release's timestamps, older than the kept objects.
   rm -rf linux-$VER && tar -xJf /k/src/linux-$VER.tar.xz
   cd linux-$VER
   for p in /k/patches/*.patch; do patch -s -p1 < \$p; done
+  # A patched file keeps its time from the last build when its content is the same, so only what a
+  # patch change touches is rebuilt (the TSO series edits headers much of the tree includes). Files no
+  # longer patched are touched, so what was built from their patched versions is rebuilt too.
+  sed -n 's|^+++ b/\([^[:space:]]*\).*|\1|p' /k/patches/*.patch | sort -u > /tmp/patched
+  mkdir -p /build/patched
+  for f in \$(cat /tmp/patched); do
+    if cmp -s \$f /build/patched/\$f; then touch -r /build/patched/\$f \$f
+    else mkdir -p /build/patched/\$(dirname \$f) && cp -p \$f /build/patched/\$f; fi
+  done
+  for f in \$(cd /build/patched && find . -type f | sed 's|^[.]/||'); do
+    grep -qx \$f /tmp/patched || { touch \$f; rm /build/patched/\$f; }
+  done
   mkdir -p /build/obj
   cp /k/config-6.18-virt /tmp/config
   ./scripts/config --file /tmp/config --set-str LOCALVERSION -mdock --disable LOCALVERSION_AUTO \
