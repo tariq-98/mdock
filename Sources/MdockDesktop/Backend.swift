@@ -6,6 +6,10 @@ enum Backend {
     static let controlSocket = state.appendingPathComponent("control.sock").path
     static let dockerSocket = state.appendingPathComponent("docker.sock").path
     static let configFile = state.appendingPathComponent("config.json")
+    static let idleMarker = state.appendingPathComponent("idle-stopped").path
+
+    /// Stopped by idle stop: launchd starts the VM again on the next docker command.
+    static var idleStopped: Bool { FileManager.default.fileExists(atPath: idleMarker) }
 
     /// The CLI: bundled next to the app's executable, or the development build.
     static var cli: String? {
@@ -147,6 +151,23 @@ struct DaemonStatus: Decodable {
     var bootSeconds: Double
     var forwards: [String]
     var accel: [AccelService]?
+    /// Translator per x86 architecture: "amd64"/"386" → "rosetta", "fex" or "qemu".
+    var x86: [String: String]?
+    /// x86 translators get x86's memory order from the CPU (mdock's guest kernel).
+    var tso: Bool?
+    var kernel: String?
+    var kubernetes: KubernetesInfo?
+    var idleStop: IdleStop?
+
+    struct KubernetesInfo: Decodable {
+        var state: String
+        var version: String?
+    }
+
+    struct IdleStop: Decodable {
+        var enabled: Bool
+        var minutes: Int
+    }
 
     var isGPU: Bool { engine?.contains("GPU") ?? false }
 }

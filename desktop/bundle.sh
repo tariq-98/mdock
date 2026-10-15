@@ -43,6 +43,8 @@ for f in "$MEDIA"/bin/* "$MEDIA"/lib/*.dylib; do
 done
 cp gpu/prefix/lib/libkrun.dylib gpu/prefix/lib/libvirglrenderer.1.dylib "$APP/Contents/MacOS/gpu/lib/"
 [ -f desktop/AppIcon.icns ] && cp desktop/AppIcon.icns "$APP/Contents/Resources/"
+# The box artwork the app shows in its windows and turns into its menu bar glyph.
+cp desktop/Box.png "$APP/Contents/Resources/"
 # The guest's own programs (linux/arm64 ELFs, so resources rather than signed executables): the
 # bridges' guest side, FEX (x86 with hardware TSO on mdock's kernel) and QEMU user-mode (x86 without).
 [ -f guest/out/mdock-guestd ] && [ -f guest/out/FEXInterpreter ] && [ -f guest/out/qemu-x86_64 ] && [ -f guest/out/qemu-i386 ] || guest/build.sh
@@ -90,5 +92,6 @@ codesign --force --sign - "$APP"
 
 mkdir -p "$HOME/Applications"
 rm -rf "$HOME/Applications/mdock Desktop.app"
-cp -R "$APP" "$HOME/Applications/"
+# Moved, not copied: a second copy in dist/ shows up in Spotlight and Launchpad as a duplicate app.
+mv "$APP" "$HOME/Applications/"
 echo "Installed $HOME/Applications/mdock Desktop.app"
