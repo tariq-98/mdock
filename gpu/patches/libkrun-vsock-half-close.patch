@@ -29,27 +29,31 @@
              fd,
              status: ProxyStatus::ReverseInit,
              mem,
-@@ -188,6 +196,19 @@
-         push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
-     }
- 
+@@ -184,6 +192,23 @@
+             local_port: 1025,
+             peer_port: self.control_port,
+             result,
++        };
++        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
++    }
++
 +    fn push_shutdown(&self, flags: u32) {
 +        debug!(
 +            "push_shutdown: id: {}, peer_port: {}, local_port: {}, flags: {}",
 +            self.id, self.peer_port, self.local_port, flags
 +        );
++        // The guest takes the host's credit from every header, this one included: it must
++        // carry what the host has really consumed, or a guest that has sent more than a
++        // buffer's worth believes the host is full and stops sending.
 +        let rx = MuxerRx::Shutdown {
 +            local_port: self.local_port,
 +            peer_port: self.peer_port,
 +            flags,
-+        };
-+        push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
-+    }
-+
-     fn push_reset(&self) {
-         debug!(
-             "push_reset: id: {}, peer_port: {}, local_port: {}",
-@@ -266,7 +287,10 @@
++            fwd_cnt: self.tx_cnt.0,
+         };
+         push_packet(self.cid, rx, &self.rxq, &self.queue, &self.mem);
+     }
+@@ -266,7 +291,10 @@
                          pkt.hdr().len() + cnt
                      }
                      RecvPkt::Close => {
@@ -61,7 +65,7 @@
                          0
                      }
                      RecvPkt::Error => 0,
-@@ -489,8 +513,10 @@
+@@ -489,8 +517,10 @@
  
          self.status = ProxyStatus::Connected;
  
@@ -73,7 +77,7 @@
              ..Default::default()
          }
      }
-@@ -543,7 +569,10 @@
+@@ -543,7 +573,10 @@
          self.peer_shutdown |= shutdown;
          self.do_shutdown(pkt);
  
@@ -85,7 +89,7 @@
              return ProxyUpdate::default();
          }
  
-@@ -600,6 +629,17 @@
+@@ -600,6 +633,17 @@
              if self.status == ProxyStatus::Connected {
                  let (signal_queue, wait_credit) = self.recv_pkt();
                  update.signal_queue = signal_queue;
@@ -105,22 +109,23 @@
                      self.status = ProxyStatus::WaitingCreditUpdate;
 --- a/src/devices/src/virtio/vsock/muxer.rs
 +++ b/src/devices/src/virtio/vsock/muxer.rs
-@@ -71,6 +71,12 @@
-         local_port: u32,
+@@ -72,6 +72,13 @@
          peer_port: u32,
          result: i32,
-+    },
+     },
 +    /// Host-side half-close (mdock): VSOCK_OP_SHUTDOWN with the given flags.
 +    Shutdown {
 +        local_port: u32,
 +        peer_port: u32,
 +        flags: u32,
-     },
++        fwd_cnt: u32,
++    },
  }
  
+ pub fn push_packet(
 --- a/src/devices/src/virtio/vsock/muxer_rxq.rs
 +++ b/src/devices/src/virtio/vsock/muxer_rxq.rs
-@@ -92,6 +92,22 @@
+@@ -92,6 +92,23 @@
  
  pub fn rx_to_pkt(cid: u64, rx: MuxerRx, pkt: &mut VsockPacket) {
      match rx {
@@ -128,6 +133,7 @@
 +            local_port,
 +            peer_port,
 +            flags,
++            fwd_cnt,
 +        } => {
 +            pkt.set_op(uapi::VSOCK_OP_SHUTDOWN)
 +                .set_src_cid(uapi::VSOCK_HOST_CID)
@@ -138,7 +144,7 @@
 +                .set_type(uapi::VSOCK_TYPE_STREAM)
 +                .set_flags(flags)
 +                .set_buf_alloc(defs::CONN_TX_BUF_SIZE as u32)
-+                .set_fwd_cnt(0);
++                .set_fwd_cnt(fwd_cnt);
 +        }
          MuxerRx::Reset {
              local_port,

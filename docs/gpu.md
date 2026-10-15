@@ -83,14 +83,19 @@ faster and works on both engines.
     never lowers the footprint, so each reported range is unmapped, marked `MADV_FREE_REUSABLE` and
     mapped back.
   - `libkrun-vsock-half-close.patch`: a host EOF on a vsock↔unix connection is sent as a vsock
-    `SHUTDOWN(SEND)`, not a reset. Without it, `docker run`/`attach` loses all output.
+    `SHUTDOWN(SEND)`, not a reset. Without it, `docker run`/`attach` loses all output. The shutdown
+    carries the host's real consumed count (`fwd_cnt`): Linux takes the host's credit from every
+    header, so a zero there told a guest that had already sent more than a buffer's worth that the
+    host was full, and it stopped sending.
   - `libkrun-vsock-prompt-close.patch`: macOS refuses `shutdown(SHUT_RDWR)` (ENOTCONN, and shuts
     nothing) on a unix socket whose peer already half-closed, so the host end of a finished
     connection stayed open until libkrun's 5 s reaper: every attached `docker run` took 5 s longer
     (now 0.18 s). It also stops polling finished connections, which spun the event loop meanwhile.
   - `libkrun-quiet-vsock.patch`: no time-sync datagrams (only libkrunfw's kernel reads them) and no
     error line for the resets the guest answers them with.
-- **gvproxy 0.8.9** for guest networking
+- **gvproxy 0.8.9** for guest networking. The guest's NIC is created with libkrun's
+  `COMPAT_NET_FEATURES` (checksum offload, TSO and UFO both ways), so it hands gvproxy 64 KiB segments
+  instead of 1500-byte packets.
 
 mdock loads libkrun with `dlopen` and boots the same guest kernel directly (mdock's, else Alpine's),
 without krunkit or EFI firmware. MoltenVK comes from homebrew-core, because building it needs a full

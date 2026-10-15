@@ -53,6 +53,10 @@ enum Krun {
     private static let virglVenus: UInt32 = 1 << 6
     private static let virglNoVirgl: UInt32 = 1 << 7
     private static let netFlagVfkit: UInt32 = 1 << 0
+    /// libkrun.h's COMPAT_NET_FEATURES: checksum offload and TSO/UFO both ways, so the guest hands
+    /// gvproxy 64 KiB segments instead of 1500-byte packets (krunkit measures ~2.6 -> ~20 Gbit/s into
+    /// the VM).
+    private static let netFeatures: UInt32 = 1 << 0 | 1 << 1 | 1 << 7 | 1 << 10 | 1 << 11 | 1 << 14
     private static let kernelFormatRaw: UInt32 = 0
     private static let diskFormatRaw: UInt32 = 0
 
@@ -116,7 +120,7 @@ enum Krun {
 
         var mac = config.mac.split(separator: ":").compactMap { UInt8($0, radix: 16) }
         if mac.count != 6 { mac = [0x5a, 0x94, 0xef, 0xe4, 0x0c, 0xee] }
-        check(fn("krun_add_net_unixgram", AddNetUnixgram.self)(id, networkSocket.path, -1, &mac, 0, netFlagVfkit), "add net")
+        check(fn("krun_add_net_unixgram", AddNetUnixgram.self)(id, networkSocket.path, -1, &mac, netFeatures, netFlagVfkit), "add net")
 
         // VRAM is a host window, not committed memory; krunkit sizes it the same way:
         // up to host RAM, within the 36-bit IPA space minus guest RAM.
