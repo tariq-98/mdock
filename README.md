@@ -18,11 +18,11 @@ using it.
 
 Measured against Docker Desktop 4.37.2 on the same M1 ([full comparison](docs/comparison.md)):
 
-- **Faster**: a cold start to `docker info` in 3.7 s (Docker Desktop: 6.9 s), `docker run` in 170 ms
-  (260 ms), and published ports 10–24× faster.
+- **Faster**: a cold start to `docker info` in 1.3 s (Docker Desktop: 6.9 s), `docker run` in 130 ms
+  (260 ms), and published ports at 23–34 Gbit/s (0.5–0.7 Gbit/s).
 - **Uses the whole Mac when you need it, and nothing when you don't**: all CPU cores, and with
   autostart on the VM stops after 10 idle minutes; your next docker command starts it again in about
-  3.5 s.
+  1.2 s. Idle with nothing running, the VM uses about 1% of one core.
 - **x86 images** run through Rosetta. With mdock's own guest kernel, 32-bit ones run through FEX at
   2–5× QEMU's speed, and the CPU itself enforces x86's memory ordering ([how](docs/x86.md)).
 - **The Mac's hardware in containers**: GPU (Vulkan, OpenGL, OpenCL), the media engine for video
@@ -77,7 +77,7 @@ mdock start
 ```
 
 The first start downloads Alpine Linux (about 230 MB), creates the VM and installs Docker in it, which
-takes a minute or two. It also creates the `mdock` docker context. Later starts take about 3 seconds.
+takes a minute or two. It also creates the `mdock` docker context. Later starts take about a second.
 
 Always build with `./build.sh`: it signs mdock with the entitlement macOS requires for running VMs. A
 plain `swift build` produces an `mdock` that can't start the VM.
@@ -206,7 +206,7 @@ Desktop's helper did, for tools that only look there.
 
 | Command | |
 |---|---|
-| `mdock start [--gpu\|--no-gpu]` / `stop` / `restart` | Boot the VM (about 3 s), shut it down, or both |
+| `mdock start [--gpu\|--no-gpu]` / `stop` / `restart` | Boot the VM (about 1 s), shut it down, or both |
 | `mdock status [--json]` | Engine, CPUs, memory, ports, translators, accelerators, Kubernetes |
 | `mdock doctor [--json]` | Check everything mdock needs, with fixes; exit status 1 on failure |
 | `mdock autostart on\|off` | Start at login, restart after a crash, stop when idle |
@@ -260,12 +260,12 @@ Utility.
 ## Limitations
 
 - Apple silicon and macOS 14+ only, and tested on one Mac so far.
-- Under `mdock autostart on`, published ports run at 0.4–0.85 GB/s instead of the VM network's full
-  speed (still about 10× Docker Desktop): macOS doesn't let a background agent connect to the VM
-  directly.
 - File changes reach containers as attribute-change events, which file watchers handle, but a tool
   that waits specifically for a "modified" event won't see one.
-- A server in a container can't keep reading from a client after the client finishes sending.
+- On the GPU engine, a server in a container can't keep reading from a client after the client
+  finishes sending, and a slow reader on the Mac (`docker logs | less`) loses its connection once it
+  falls 64 MiB behind. The default engine carries ports and the Docker API over TCP, which has neither
+  problem ([why](docs/architecture.md#vsock-and-why-the-bulk-goes-over-the-vms-network)).
 - The default engine keeps memory the VM has used until the VM stops; idle stop gives it back.
 - GPU: Vulkan 1.2 and OpenGL 2.1 at most, and no CUDA. No GPU on the default engine.
 - Rosetta's ahead-of-time cache is off by default because it breaks some programs.

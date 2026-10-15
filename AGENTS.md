@@ -32,7 +32,7 @@ Engine from containers. One VM is shared by everything on the Mac, including lon
 - **A shell in any container**, even one without a shell (distroless): `mdock debug CONTAINER
   [IMAGE]` starts IMAGE (alpine) in its network and process namespaces, in its files (/proc/1/root).
 - **Idle stop**: under autostart the VM shuts down after `idle` minutes (default 10) with no
-  containers and no docker clients; any docker command starts it again and waits (~3.5 s). `mdock
+  containers and no docker clients; any docker command starts it again and waits (~1.2 s). `mdock
   status` then says "stopped after being idle": that's normal, not a failure. `mdock set idle=0`
   turns it off.
 - **Mac accelerators** (`mdock status --json` shows what's ready):
@@ -86,12 +86,18 @@ Rules learned the hard way:
 
 - **Never leave a host-side vsock socket unread.** Virtualization.framework writes guest data into
   the Mac's sockets from a single serial queue per VM; one blocked write stalls every vsock
-  connection (docker.sock, ports, the guest's reports, poweroff). Use `Sockets.splice` (it buffers and
-  drops only the connection that falls 64 MiB behind) and never block a read loop on other vsock work.
+  connection (docker.sock, ports, the guest's reports, poweroff). Use `Sockets.splice` with `vsock:`
+  naming the vsock end (it buffers what comes out of it and drops only the connection that falls 64
+  MiB behind; every other direction gets plain flow control) and never block a read loop on other
+  vsock work. Bulk streams belong on dial-back instead (next rule).
 - The framework drops a half-close made in the guest; guest bridges close outright instead (socat
   `shut-close`, `SHUT_RDWR` in `mdock-guestd`). Half-closes from the Mac arrive normally.
 - macOS Local Network privacy stops the launchd-run daemon from connecting to the VM's subnet
-  (192.168.64.x), so it relays ports over vsock; loopback (host.docker.internal) is fine.
+  (192.168.64.x) but not from accepting connections from it. So the Mac never dials into the VM:
+  published TCP ports and the Docker API use dial-back (`DialBack.swift`; the guest connects to the
+  Mac at 192.168.64.1 per request, identified by a random id sent over vsock), and host.docker.internal
+  connects to the same listener with a per-boot secret (`/run/mdock/mac` in the guest). That gives
+  TCP's flow control and half-closes end to end. Measure a change to that path with `./bench.sh mdock`.
 - Disks must stay `.cached` + `.fsync`; `.automatic` corrupted ext4.
 - macOS refuses `shutdown(SHUT_RDWR)` (ENOTCONN, and shuts nothing) on a unix socket whose peer has
   already half-closed; shut the write side on its own (`Sockets.shutdownBoth`). libkrun hit this too
@@ -101,6 +107,18 @@ Rules learned the hard way:
   guest zeroes (touches) every page it hands to the balloon.
 - The guest reads the seed disk's plain ISO 9660 names, lowercased: a seed file called
   `FEXInterpreter` arrives as `fexinterpreter`. `Guest.writeSeed` lowercases names; keep it that way.
+- The guest boots without an initramfs when the kernel can mount the root disk itself
+  (`~/.mdock/kernel.mounts-root`, written by `installKernel`). Anything that reads random numbers at
+  boot (dhcpcd, dockerd) waits for the kernel's entropy pool: keep the virtio RNG loading early, or
+  the boot stalls ~1 s. `cat /run/mdock/boot` in the guest shows where boot time goes.
+- crun (1.30, Alpine) starts containers ~15% faster than runc under Docker 29, but it ignores
+  `--pid=host`: the container gets its own PID namespace (Docker's spec has none; runc honours it),
+  which breaks mdock's own guest commands. Re-test `--pid=host` before trying crun again.
+- ArcBox's FUSE spin-wait kernel patch (a virtiofs metadata call polls for its reply before sleeping)
+  doesn't pay on an M1: at a 40 µs budget it halved the latency of lookups of missing names but made
+  stats of existing files 25% slower (the spinning vCPU slows the Mac's side down), and shorter
+  budgets were worse at both; whole workloads came out even, at the cost of burnt CPU. Re-measure on
+  a newer Mac before adopting it.
 - In a VM every write to ACTLR_EL1 (the TSO bit) traps to the hypervisor; the kernel writes it only
   when a switch changes the memory model (`kernel/patches/0018-…`), or every context switch pays.
 - Stock libkrun panics on any system register it doesn't handle, killing the VM: a kernel feature
