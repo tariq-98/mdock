@@ -379,6 +379,11 @@ enum Sockets {
                 let client = accept(fd, nil, nil)
                 if client < 0 {
                     if errno == EINTR || errno == ECONNABORTED || errno == EAGAIN { continue }
+                    // Out of descriptors: wait for connections to finish rather than stop listening.
+                    if errno == EMFILE || errno == ENFILE {
+                        usleep(100_000)
+                        continue
+                    }
                     return
                 }
                 var one: Int32 = 1
