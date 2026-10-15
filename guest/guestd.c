@@ -21,6 +21,9 @@
 //   mdock-guestd notify  [vsock-port]             Mac file changes -> inotify (2377): for each path
 //                                                 line, re-applies the file's mode, which raises
 //                                                 IN_ATTRIB for watchers inside containers.
+//   mdock-guestd clock   [vsock-port]             The Mac's time (2380), "<seconds>.<nanoseconds>\n" after
+//                                                 the Mac sleeps (the VM's clock stops meanwhile): steps
+//                                                 the clock when it is more than a second off.
 //   mdock-guestd tso                              Exit status 0 if this kernel can run a thread in x86's
 //                                                 memory order (Apple silicon TSO through
 //                                                 PR_SET_MEM_MODEL, mdock's kernel): it tries on itself.
@@ -54,6 +57,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 
 #define BUF (256 * 1024)
@@ -315,6 +319,37 @@ static void *dial_conn(void *arg) {
     return NULL;
 }
 
+/* Reads one line into buf, a byte at a time (the stream is a few dozen bytes per connection). */
+static int read_line(int fd, char *buf, size_t size) {
+    size_t n = 0;
+    while (n < size - 1) {
+        ssize_t r = read(fd, buf + n, 1);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) return -1;
+        if (buf[n] == '\n') break;
+        n++;
+    }
+    buf[n] = 0;
+    return n < size - 1 ? 0 : -1;
+}
+
+static void *clock_conn(void *arg) {
+    int v = (int)(intptr_t)arg;
+    char line[48];
+    long long sec;
+    long nsec;
+    if (read_line(v, line, sizeof line) == 0 && sscanf(line, "%lld.%ld", &sec, &nsec) == 2 && nsec >= 0 &&
+        nsec < 1000000000) {
+        struct timespec now, mac = {.tv_sec = (time_t)sec, .tv_nsec = nsec};
+        clock_gettime(CLOCK_REALTIME, &now);
+        long long off = (long long)(mac.tv_sec - now.tv_sec) * 1000000000LL + (mac.tv_nsec - now.tv_nsec);
+        if ((off < 0 ? -off : off) > 1000000000LL && clock_settime(CLOCK_REALTIME, &mac) == 0)
+            fprintf(stderr, "mdock-guestd: clock was %.1f s off; set to the Mac's time\n", (double)off / 1e9);
+    }
+    close(v);
+    return NULL;
+}
+
 /* Lines from a stream read in chunks: the control stream brings one per connection. */
 struct lines {
     int fd;
@@ -568,13 +603,14 @@ int main(int argc, char **argv) {
         serve(listen_tcp(arg_port(argc, argv, 2, 61080)), hostfwd_conn);
     }
     if (!strcmp(mode, "notify")) serve(listen_vsock(arg_port(argc, argv, 2, 2377), 0), notify_conn);
+    if (!strcmp(mode, "clock")) serve(listen_vsock(arg_port(argc, argv, 2, 2380), 0), clock_conn);
     if (!strcmp(mode, "udp")) serve(listen_vsock(arg_port(argc, argv, 2, 2378), 1 << 20), udp_conn);
     if (!strcmp(mode, "tso")) return prctl(0x4d4d444c /* PR_SET_MEM_MODEL */, 1 /* _TSO */, 0, 0, 0) ? 1 : 0;
     if (!strcmp(mode, "unix") && argc > 3) {
         unix_target = argv[3];
         serve(listen_vsock(arg_port(argc, argv, 2, 2375), 4 << 20), unix_conn);
     }
-    fprintf(stderr, "usage: mdock-guestd dialback|relay|notify|udp [vsock-port] | hostfwd [tcp-port] [vsock-port]"
+    fprintf(stderr, "usage: mdock-guestd dialback|relay|notify|udp|clock [vsock-port] | hostfwd [tcp-port] [vsock-port]"
                     " | unix vsock-port path | tso\n");
     return 2;
 }

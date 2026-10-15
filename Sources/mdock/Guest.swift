@@ -22,6 +22,8 @@ enum Guest {
     /// Vsock port where mdock-guestd takes requests to dial back to the Mac for published TCP ports
     /// (DialBack).
     static let dialBackPort: UInt32 = 2379
+    /// Vsock port where mdock-guestd sets the guest's clock to the Mac's time.
+    static let clockPort: UInt32 = 2380
     /// Vsock port the host listens on for host.docker.internal: mdock-guestd sends "<port>\n" and
     /// the connection's bytes, and the host connects to its own loopback.
     static let hostForwardPort: UInt32 = 1031
@@ -215,6 +217,7 @@ enum Guest {
       $guestd notify 2377 &
       $guestd udp 2378 &
       $guestd dialback 2379 &
+      $guestd clock 2380 &
     else
       # nofork: mdock-relay gets the vsock connection itself as stdin/stdout (no extra hop).
       socat -t 86400 VSOCK-LISTEN:2376,reuseaddr,fork,backlog=128 EXEC:/usr/local/sbin/mdock-relay,nofork &

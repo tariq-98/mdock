@@ -324,12 +324,18 @@ final class Daemon: NSObject, VZVirtualMachineDelegate, VZVirtioSocketListenerDe
 
     /// The guest agent reports every 5 s over vsock. Silence means the vsock link (and with it
     /// docker.sock and every accel relay) is stuck; surface that instead of hanging quietly. Under
-    /// launchd, a link that stays dead (and docker unreachable) gets the VM restarted.
+    /// launchd, a link that stays dead (and docker unreachable) gets the VM restarted. Also notices
+    /// when the Mac has slept: its uptime clock pauses then, while the monotonic one runs on.
     private func startWatchdog() {
         Thread.detachNewThread { [self] in
+            var awake = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), total = clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)
             while true {
                 sleep(10)
                 reopenLogIfRotated()
+                let (nowAwake, nowTotal) = (clock_gettime_nsec_np(CLOCK_UPTIME_RAW), clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW))
+                let slept = Int64(bitPattern: nowTotal &- total) - Int64(bitPattern: nowAwake &- awake)
+                (awake, total) = (nowAwake, nowTotal)
+                if slept > 2_000_000_000 && stateLock.withLock({ ready }) { setGuestClock(sleptFor: slept) }
                 let silent = stateLock.withLock { ready ? Double(DispatchTime.now().uptimeNanoseconds - lastGuestReport) / 1e9 : 0 }
                 if silent > 30 {
                     stateLock.withLock {
@@ -346,6 +352,17 @@ final class Daemon: NSObject, VZVirtualMachineDelegate, VZVirtioSocketListenerDe
                 }
             }
         }
+    }
+
+    /// The VM's clock stops while the Mac sleeps, and chrony only corrects it at its next poll (many
+    /// minutes away, or never while offline): after a sleep the Mac's own time goes to the guest.
+    private func setGuestClock(sleptFor slept: Int64) {
+        guard let fd = vsockConnect(Guest.clockPort) else { return }
+        var now = timespec()
+        clock_gettime(CLOCK_REALTIME, &now)
+        Sockets.writeAll(fd, String(format: "%ld.%09ld\n", now.tv_sec, now.tv_nsec))
+        close(fd)
+        log(String(format: "the Mac slept for %.0f s: sent the guest its time", Double(slept) / 1e9))
     }
 
     /// GET /_ping through the vsock bridge, with deadlines on both connect and reply.

@@ -132,7 +132,7 @@ enum Krun {
         check(fn("krun_disable_implicit_vsock", CtxOnly.self)(id), "disable_implicit_vsock")
         check(fn("krun_add_vsock", AddVsock.self)(id, 0), "add_vsock")
         let addPort = fn("krun_add_vsock_port2", AddVsockPort2.self)
-        for port in [Guest.dockerPort, Guest.relayPort, Guest.poweroffPort, Guest.fileEventsPort, Guest.udpPort] {
+        for port in [Guest.dockerPort, Guest.relayPort, Guest.poweroffPort, Guest.fileEventsPort, Guest.udpPort, Guest.clockPort] {
             unlink(socketPath(port))
             check(addPort(id, port, socketPath(port), true), "vsock port \(port)")
         }
