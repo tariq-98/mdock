@@ -61,6 +61,8 @@ delete` (removes every image and volume), `mdock kubernetes reset`.
 
 ## Working on the code
 
+- How it fits together: [docs/architecture.md](docs/architecture.md); the x86 translators and guest
+  kernel: [docs/x86.md](docs/x86.md); the GPU engine and its patches: [docs/gpu.md](docs/gpu.md).
 - Build with `./build.sh` only. A plain `swift build` relinks `mdock` without the
   `com.apple.security.virtualization` entitlement and the VM won't start. `mdock doctor` checks this.
 - The daemon runs under launchd (`mdock autostart on`, label `local.mdock.daemon`); `mdock restart`
@@ -109,6 +111,11 @@ Rules learned the hard way:
 - Under FEX, Go's asynchronous preemption (SIGURG) crashes Go programs; FEX's patch adds
   `GODEBUG=asyncpreemptoff=1` to what it runs. FEX's own code cache is experimental and needs
   FEXServer; a cache shared between containers would let one poison another's code, so there is none.
+- After changing the desktop app, launch it (`open ~/Applications/"mdock Desktop.app"`); building
+  doesn't catch a crash at launch. SwiftUI creates the app's model before `NSApp` exists, so code
+  reached from `Model.init` must not assume it. Such a crash exits with status 133 and leaves no
+  crash report; a debug build (`swift build --product MdockDesktop`, then run
+  `.build/arm64-apple-macosx/debug/MdockDesktop`) prints the reason and the line.
 - On the GPU engine a guest Vulkan program's mistake mustn't reach MoltenVK: it runs in the VM's
   process, so a crash there kills the VM (`virglrenderer-no-pipeline-guard.patch`). The VMM logs a
   backtrace to `~/.mdock/daemon.log` when it dies.
