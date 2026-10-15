@@ -139,6 +139,7 @@ func ensureDockerContext() {
 
 func start() throws {
     if let s = status(), s["ready"] as? Bool == true {
+        ensureDockerContext()   // the docker CLI may have been installed after the first start
         print("mdock is already running (\(s["ip"] ?? ""))")
         return
     }
