@@ -81,7 +81,7 @@ final class AccelRouter {
                 close(fd)
                 return
             }
-            Sockets.splice(fd, upstream)
+            Sockets.splice(fd, upstream, vsock: fd)
         }
     }
 

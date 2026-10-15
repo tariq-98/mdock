@@ -409,9 +409,9 @@ enum Sockets {
         }
     }
 
-    /// writeAll for a non-blocking fd: waits for room, but gives up after 60 s without progress (a
-    /// peer that stopped reading for good).
-    static func writeWaiting(_ fd: Int32, _ bytes: UnsafeRawPointer, _ count: Int) -> Bool {
+    /// writeAll for a non-blocking fd: waits for room, but by default gives up after 60 s without
+    /// progress (a peer that stopped reading for good).
+    static func writeWaiting(_ fd: Int32, _ bytes: UnsafeRawPointer, _ count: Int, timeout: Int32 = 60_000) -> Bool {
         var offset = 0
         while offset < count {
             let n = write(fd, bytes + offset, count - offset)
@@ -420,7 +420,7 @@ enum Sockets {
             } else if n < 0 && errno == EINTR {
                 continue
             } else if n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) {
-                guard wait(fd, POLLOUT, timeout: 60_000) else { return false }
+                guard wait(fd, POLLOUT, timeout: timeout) else { return false }
             } else {
                 return false
             }
@@ -437,17 +437,28 @@ enum Sockets {
 
     /// Copies bytes both ways, propagating half-close, then closes both descriptors.
     ///
-    /// Each direction has a reader and a writer thread with up to `limit` bytes queued between them,
-    /// so a source is drained promptly however slow its destination is. That matters for vsock:
-    /// Virtualization.framework writes guest data into the Mac's sockets from one serial queue per
-    /// VM, so a single host socket left unread blocks every vsock connection (docker.sock, ports,
-    /// the guest's reports). A direction that falls `limit` behind tears its connection down.
-    static func splice(_ a: Int32, _ b: Int32, limit: Int = 64 << 20, onClose: (() -> Void)? = nil) {
+    /// `vsock` is whichever of the two is a stream from the guest's vsock (or the GPU engine's
+    /// equivalent), if either. Virtualization.framework writes guest data into the Mac's sockets from
+    /// one serial queue per VM, so a single host socket left unread blocks every vsock connection
+    /// (docker.sock, ports, the guest's reports): what comes out of `vsock` is read promptly however
+    /// slow its destination is, with up to `limit` bytes queued between a reader and a writer thread,
+    /// and a direction that falls `limit` behind tears its connection down. Every other direction
+    /// reads only as fast as its destination takes the bytes, so TCP's flow control slows a fast
+    /// sender down instead (an upload from the Mac outruns vsock within milliseconds).
+    static func splice(_ a: Int32, _ b: Int32, vsock: Int32?, limit: Int = 64 << 20, onClose: (() -> Void)? = nil) {
         // Non-blocking, so the reader's direct write can never block (macOS ignores MSG_DONTWAIT on
         // these sockets); readers and the writer wait in poll() instead.
         for fd in [a, b] { _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK) }
         let group = DispatchGroup()
         for (src, dst) in [(a, b), (b, a)] {
+            if src != vsock {
+                group.enter()
+                Thread.detachNewThread {
+                    defer { group.leave() }
+                    copy(src, dst)
+                }
+                continue
+            }
             let queue = ByteQueue(limit: limit)
             group.enter()
             Thread.detachNewThread {
@@ -513,6 +524,28 @@ enum Sockets {
             close(b)
             onClose?()
         }
+    }
+
+    /// One direction of a splice with flow control: each read is written out before the next.
+    private static func copy(_ src: Int32, _ dst: Int32) {
+        let size = 256 * 1024
+        let buffer = UnsafeMutableRawPointer.allocate(byteCount: size, alignment: 16)
+        defer { buffer.deallocate() }
+        while true {
+            let n = read(src, buffer, size)
+            if n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                if errno != EINTR { wait(src, POLLIN) }
+                continue
+            }
+            if n <= 0 { break }
+            // No time limit: a client that stops reading for a while (a paused video) keeps its
+            // connection, and only this connection waits for it.
+            guard writeWaiting(dst, buffer, n, timeout: -1) else {
+                shutdownBoth(src)  // the destination is gone: end the connection
+                return
+            }
+        }
+        shutdown(dst, SHUT_WR)
     }
 
     static func readLine(_ fd: Int32, limit: Int = 4096) -> String? {

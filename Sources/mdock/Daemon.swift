@@ -632,7 +632,7 @@ final class Daemon: NSObject, VZVirtualMachineDelegate, VZVirtioSocketListenerDe
         Sockets.acceptLoop(listener) { [self] client in
             Thread.detachNewThread { [self] in
                 guard waitUntilReady(), let guest = vsockConnect(Guest.dockerPort) else { close(client); return }
-                Sockets.splice(client, guest)
+                Sockets.splice(client, guest, vsock: guest)
             }
         }
     }
@@ -677,7 +677,7 @@ final class Daemon: NSObject, VZVirtualMachineDelegate, VZVirtioSocketListenerDe
                 finished()
                 return
             }
-            Sockets.splice(client, guest, onClose: finished)
+            Sockets.splice(client, guest, vsock: guest, onClose: finished)
         }
     }
 
@@ -822,7 +822,7 @@ final class Daemon: NSObject, VZVirtualMachineDelegate, VZVirtioSocketListenerDe
                 return
             }
             Sockets.writeAll(fd, "\u{1}")  // connected
-            Sockets.splice(fd, upstream)
+            Sockets.splice(fd, upstream, vsock: fd)
         }
     }
 
@@ -1050,14 +1050,18 @@ final class Daemon: NSObject, VZVirtualMachineDelegate, VZVirtioSocketListenerDe
                     }
                     Thread.detachNewThread { [self] in
                         var upstream: Int32?
+                        var vsock = viaRelay
                         for attempt in 0..<5 where upstream == nil {
                             if attempt > 0 { usleep(UInt32(100_000 * attempt)) }
                             upstream = viaRelay ? relayConnect(spec.port) : Sockets.tcpConnect(host: ip, port: spec.port)
                         }
                         // vmnet unreachable (a VPN hijacking the subnet, say): the relay still works.
-                        if upstream == nil, !viaRelay { upstream = relayConnect(spec.port) }
+                        if upstream == nil, !viaRelay {
+                            upstream = relayConnect(spec.port)
+                            vsock = true
+                        }
                         guard let upstream else { close(client); return }
-                        Sockets.splice(client, upstream)
+                        Sockets.splice(client, upstream, vsock: vsock ? upstream : nil)
                     }
                 }
                 stateLock.withLock { forwards[key] = cancel }

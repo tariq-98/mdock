@@ -54,9 +54,19 @@ static void die(const char *what) {
     exit(1);
 }
 
-static int listen_vsock(unsigned port) {
+/* A vsock stream's receive buffer is the credit the guest gives the Mac: how much the Mac may send
+ * before it waits to hear that the guest has read it. Linux's 256 KiB default costs an upload a round
+ * trip every 256 KiB. Memory is only used for bytes actually waiting. MAX first, as SIZE is clamped to
+ * it; accepted streams inherit both from their listener. */
+static void vsock_buffer(int fd, unsigned long long size) {
+    setsockopt(fd, AF_VSOCK, SO_VM_SOCKETS_BUFFER_MAX_SIZE, &size, sizeof size);
+    setsockopt(fd, AF_VSOCK, SO_VM_SOCKETS_BUFFER_SIZE, &size, sizeof size);
+}
+
+static int listen_vsock(unsigned port, unsigned long long buffer) {
     int fd = socket(AF_VSOCK, SOCK_STREAM | SOCK_CLOEXEC, 0);
     struct sockaddr_vm a = {.svm_family = AF_VSOCK, .svm_cid = VMADDR_CID_ANY, .svm_port = port};
+    if (fd >= 0 && buffer) vsock_buffer(fd, buffer);
     if (fd < 0 || bind(fd, (struct sockaddr *)&a, sizeof a) || listen(fd, 1024)) die("vsock listen");
     return fd;
 }
@@ -72,6 +82,7 @@ static int listen_tcp(unsigned port) {
 static int connect_vsock_host(unsigned port) {
     int fd = socket(AF_VSOCK, SOCK_STREAM | SOCK_CLOEXEC, 0);
     struct sockaddr_vm a = {.svm_family = AF_VSOCK, .svm_cid = VMADDR_CID_HOST, .svm_port = port};
+    if (fd >= 0) vsock_buffer(fd, 1 << 20);
     if (fd >= 0 && connect(fd, (struct sockaddr *)&a, sizeof a) == 0) return fd;
     if (fd >= 0) close(fd);
     return -1;
@@ -340,17 +351,19 @@ static unsigned arg_port(int argc, char **argv, int i, unsigned def) {
 int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
     const char *mode = argc > 1 ? argv[1] : "";
-    if (!strcmp(mode, "relay")) serve(listen_vsock(arg_port(argc, argv, 2, 2376)), relay_conn);
+    /* Uploads into the guest: published ports over vsock, and docker cp, image loads and build
+     * contexts through the Docker API. */
+    if (!strcmp(mode, "relay")) serve(listen_vsock(arg_port(argc, argv, 2, 2376), 1 << 20), relay_conn);
     if (!strcmp(mode, "hostfwd")) {
         hostfwd_vsock_port = arg_port(argc, argv, 3, 1031);
         serve(listen_tcp(arg_port(argc, argv, 2, 61080)), hostfwd_conn);
     }
-    if (!strcmp(mode, "notify")) serve(listen_vsock(arg_port(argc, argv, 2, 2377)), notify_conn);
-    if (!strcmp(mode, "udp")) serve(listen_vsock(arg_port(argc, argv, 2, 2378)), udp_conn);
+    if (!strcmp(mode, "notify")) serve(listen_vsock(arg_port(argc, argv, 2, 2377), 0), notify_conn);
+    if (!strcmp(mode, "udp")) serve(listen_vsock(arg_port(argc, argv, 2, 2378), 1 << 20), udp_conn);
     if (!strcmp(mode, "tso")) return prctl(0x4d4d444c /* PR_SET_MEM_MODEL */, 1 /* _TSO */, 0, 0, 0) ? 1 : 0;
     if (!strcmp(mode, "unix") && argc > 3) {
         unix_target = argv[3];
-        serve(listen_vsock(arg_port(argc, argv, 2, 2375)), unix_conn);
+        serve(listen_vsock(arg_port(argc, argv, 2, 2375), 4 << 20), unix_conn);
     }
     fprintf(stderr, "usage: mdock-guestd relay|notify|udp [vsock-port] | hostfwd [tcp-port] [vsock-port]"
                     " | unix vsock-port path | tso\n");
