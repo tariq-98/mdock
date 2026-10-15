@@ -84,6 +84,10 @@ enum Paths {
     static let seed = url("seed.iso")
     static let kernel = url("vmlinux")
     static let initrd = url("initramfs")
+    /// Present when the installed kernel has the virtio disk driver and ext4 built in (mdock's own,
+    /// kernel/build.sh): it mounts the root disk itself, so it boots without the initramfs. Delete it
+    /// to boot through the initramfs again.
+    static let kernelMountsRoot = url("kernel.mounts-root")
     /// mtimes of the guest's kernel+initramfs, as reported by the guest and as last extracted.
     static let guestKernelStamp = url("kernel.guest")
     static let extractedKernelStamp = url("kernel.extracted")
@@ -229,6 +233,13 @@ func installKernel(zboot: URL, initrd: URL) throws {
     try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: ramdisk.path)
     guard rename(kernel.path, Paths.kernel.path) == 0, rename(ramdisk.path, Paths.initrd.path) == 0 else {
         throw CommandError(description: "installing kernel: \(String(cString: strerror(errno)))")
+    }
+    // Built-in drivers leave their names in the image; modules keep theirs in the .ko files.
+    let image = try Data(contentsOf: Paths.kernel, options: .alwaysMapped)
+    if image.range(of: Data("virtio_blk".utf8)) != nil && image.range(of: Data("EXT4-fs".utf8)) != nil {
+        FileManager.default.createFile(atPath: Paths.kernelMountsRoot.path, contents: nil)
+    } else {
+        try? FileManager.default.removeItem(at: Paths.kernelMountsRoot)
     }
 }
 

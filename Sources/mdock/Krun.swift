@@ -98,8 +98,10 @@ enum Krun {
 
         let memMiB = UInt32(config.memoryGiB * 1024)
         check(fn("krun_set_vm_config", SetVMConfig.self)(id, UInt8(min(config.cpus, 255)), memMiB), "set_vm_config")
-        let cmdline = "root=/dev/vda2 ro rootfstype=ext4 modules=ext4,virtio_mmio,virtio_blk console=hvc0 quiet init_on_alloc=0 mdock.engine=krun"
-        check(fn("krun_set_kernel", SetKernel.self)(id, Paths.kernel.path, kernelFormatRaw, Paths.initrd.path, cmdline), "set_kernel")
+        let cmdline = "root=/dev/vda2 ro rootwait rootfstype=ext4 modules=ext4,virtio_mmio,virtio_blk console=hvc0 quiet init_on_alloc=0 " +
+            "rcupdate.rcu_expedited=1 rcutree.jiffies_till_first_fqs=0 rcutree.jiffies_till_next_fqs=1 mdock.engine=krun"
+        let initrd = FileManager.default.fileExists(atPath: Paths.kernelMountsRoot.path) ? nil : Paths.initrd.path
+        check(fn("krun_set_kernel", SetKernel.self)(id, Paths.kernel.path, kernelFormatRaw, initrd, cmdline), "set_kernel")
 
         // Same disks and order as the VZ engine: boot=vda, data=vdb, seed=vdc.
         let addDisk = fn("krun_add_disk2", AddDisk2.self)

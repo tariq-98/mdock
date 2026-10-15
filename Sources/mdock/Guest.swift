@@ -70,9 +70,14 @@ enum Guest {
       umount $SEED
     fi
 
-    for m in virtiofs vsock vmw_vsock_virtio_transport virtio_balloon binfmt_misc virtio_gpu; do
+    # (Built into mdock's kernel; modules in Alpine's. The GPU only exists on the GPU engine.)
+    for m in virtiofs vsock vmw_vsock_virtio_transport virtio_balloon binfmt_misc; do
       modprobe -q "$m" 2>/dev/null || true
     done
+    grep -q mdock.engine=krun /proc/cmdline && modprobe -q virtio_gpu
+    # Small readahead: the default 8 MiB pulls in data nothing asked for, and on Virtualization.framework
+    # every page the guest touches stays charged to the Mac (which caches the disk images anyway).
+    for q in /sys/block/vd*/queue/read_ahead_kb; do echo 128 > "$q"; done
 
     # /var/lib/docker lives on the second virtio disk, formatted on first boot.
     DATA=/dev/vdb
@@ -147,8 +152,10 @@ enum Guest {
 
     grep -q '^rc_need="mdock-guest"' /etc/conf.d/docker || echo 'rc_need="mdock-guest"' >> /etc/conf.d/docker
     sed -i 's/^#\{0,1\}rc_cgroup_mode=.*/rc_cgroup_mode="unified"/' /etc/rc.conf
-    # Skip ARP probing and don't wait for IPv6 router adverts.
-    grep -q '^noarp' /etc/dhcpcd.conf || printf 'noarp\nwaitip 4\n' >> /etc/dhcpcd.conf
+    # DHCP without the ARP probe or the random start delay, and in the background: waiting for the
+    # lease held up the whole boot by ~2 s. mdock-agent waits for the address before reporting ready.
+    sed -i '/^waitip/d' /etc/dhcpcd.conf
+    for option in noarp nodelay background; do grep -q "^$option" /etc/dhcpcd.conf || echo "$option" >> /etc/dhcpcd.conf; done
     # resolv.conf belongs to mdock-agent (dnsmasq); dhcpcd must not rewrite it.
     grep -q '^nohook resolv.conf' /etc/dhcpcd.conf || echo 'nohook resolv.conf' >> /etc/dhcpcd.conf
     # Step the clock whenever it is off by >1s: the VM's clock stalls while the Mac sleeps.
@@ -162,6 +169,12 @@ enum Guest {
     for s in mdock-guest docker mdock-agent chronyd; do rc-update add "$s" default >/dev/null 2>&1; done
     # Boot speed: power-off arrives over vsock, not ACPI; no SSH; cloud-init is done.
     for s in acpid cloud-init-local; do rc-update del "$s" boot >/dev/null 2>&1; done
+    # hwdrivers loads a module for every device it finds (a framebuffer, a GPIO controller, crypto):
+    # mdock needs none of them, and loads what it does need itself (mdock-guest).
+    rc-update del hwdrivers sysinit >/dev/null 2>&1
+    # Early entropy: with no initramfs or hwdrivers to load the virtio RNG, the kernel's random pool
+    # filled only after ~1.5 s, and the boot waited on it (dhcpcd and dockerd read random numbers).
+    grep -qx virtio_rng /etc/modules || echo virtio_rng >> /etc/modules
     for s in sshd cloud-init cloud-config cloud-final cloud-init-hotplugd; do rc-update del "$s" default >/dev/null 2>&1; done
 
     install -m 0644 "$SRC/instance-id" /etc/mdock/instance-id
@@ -176,6 +189,10 @@ enum Guest {
     # Bridges the Docker socket to the host over vsock and reports guest state.
     trap 'kill 0' EXIT INT TERM
     notify() { echo "$*" | socat -u - VSOCK-CONNECT:2:1024 2>/dev/null; }
+    # Seconds since the kernel started, per boot step: cat /run/mdock/boot
+    mkdir -p /run/mdock
+    mark() { echo "$(cut -d' ' -f1 /proc/uptime) $1" >> /run/mdock/boot; }
+    mark agent
 
     guestd=/usr/local/sbin/mdock-guestd
     if [ -x $guestd ]; then
@@ -201,7 +218,8 @@ enum Guest {
     socat -u VSOCK-LISTEN:1025,reuseaddr SYSTEM:'poweroff' &
 
     i=0
-    while [ ! -S /var/run/docker.sock ] && [ $i -lt 300 ]; do sleep 0.1; i=$((i+1)); done
+    while [ ! -S /var/run/docker.sock ] && [ $i -lt 1500 ]; do sleep 0.02; i=$((i+1)); done
+    mark docker
 
     # Rosetta's ahead-of-time cache (`mdock set aot=on`; off by default): rosettad keeps translated
     # amd64 code on the data disk, so it is translated once rather than on every run. It has to run
@@ -232,10 +250,10 @@ enum Guest {
     ip=""
     while [ -z "$ip" ]; do
       ip=$(ip -4 -o addr show eth0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
-      [ -n "$ip" ] || sleep 0.1
+      [ -n "$ip" ] || sleep 0.02
     done
     # Packages added after first boot are installed here, once the network is up.
-    apk info -e $(cat /etc/mdock/packages) >/dev/null 2>&1 || apk add -q $(cat /etc/mdock/packages)
+    mark ip
 
     # host.docker.internal -> the Mac. dnsmasq on the guest IP answers for the guest and, through
     # it, for every container network.
@@ -271,6 +289,10 @@ enum Guest {
     socat -t 86400 TCP4-LISTEN:50052,bind="$ip",reuseaddr,fork,backlog=128,nodelay VSOCK-CONNECT:2:1030 &
 
     notify "ready $ip"
+    mark ready
+    # Packages added to mdock after this guest was created; installed after ready, so a download never
+    # holds up the boot.
+    apk info -e $(cat /etc/mdock/packages) >/dev/null 2>&1 || apk add -q $(cat /etc/mdock/packages) &
     # The kernel mdock boots: its own (kernel/build.sh: TSO for x86 translators) once installed, else
     # Alpine's. The Mac re-extracts it from /boot when this stamp changes.
     kfiles="/boot/vmlinuz-virt /boot/initramfs-virt"
@@ -518,6 +540,14 @@ enum Guest {
     vm.max_map_count = 262144
     net.core.somaxconn = 4096
     net.ipv4.ip_forward = 1
+    # No IPv6 duplicate-address detection: the guest is alone on its NAT link, and Alpine's ifup
+    # waits for it to finish (if-up.d/dad), which held up every boot by ~1.7 s.
+    net.ipv6.conf.all.accept_dad = 0
+    net.ipv6.conf.default.accept_dad = 0
+    net.ipv6.conf.eth0.accept_dad = 0
+    # No background compaction: Virtualization.framework keeps every page the guest touches charged
+    # to the Mac, so moving pages around for nothing only grows the VM's footprint.
+    vm.compaction_proactiveness = 0
     """#
 
     /// (seed file name, install path, mode, content)

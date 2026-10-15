@@ -99,12 +99,16 @@ final class Daemon: NSObject, VZVirtualMachineDelegate, VZVirtioSocketListenerDe
         vz.platform = platform
 
         let loader = VZLinuxBootLoader(kernelURL: Paths.kernel)
-        loader.initialRamdiskURL = Paths.initrd
+        // A kernel that mounts the root disk itself skips the initramfs (~0.2 s of every boot).
+        loader.initialRamdiskURL = FileManager.default.fileExists(atPath: Paths.kernelMountsRoot.path) ? nil : Paths.initrd
         // init_on_alloc=0: Alpine's kernel zeroes every page it allocates, including the ones it hands
         // to the memory balloon, which would touch gigabytes the guest is giving away (and
         // Virtualization.framework keeps charging the VM for every page the guest has ever touched).
         // (init_on_free=1 is no better: it zeroes all of memory at boot.)
-        loader.commandLine = "root=/dev/vda2 ro rootfstype=ext4 modules=ext4 console=hvc0 quiet init_on_alloc=0"
+        // rcu_expedited and quick force-quiescent-state scans: shorter RCU grace periods, which network
+        // namespace setup and teardown wait on at every container start and stop.
+        loader.commandLine = "root=/dev/vda2 ro rootwait rootfstype=ext4 modules=ext4 console=hvc0 quiet init_on_alloc=0 " +
+            "rcupdate.rcu_expedited=1 rcutree.jiffies_till_first_fqs=0 rcutree.jiffies_till_next_fqs=1"
         vz.bootLoader = loader
 
         let sync: VZDiskImageSynchronizationMode = switch config.diskSync {

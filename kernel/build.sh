@@ -7,6 +7,8 @@
 #              memory order (TSO) instead of the translator emulating it.
 #   0018       mdock: touch ACTLR_EL1 on a context switch only when the memory model changes (each
 #              access traps to the hypervisor in a VM).
+# The VM's own devices (virtio block, mmio, net, vsock, balloon, rng, virtiofs) and ext4 are built in, not
+# modules: the kernel mounts the root disk itself and mdock boots it without an initramfs (~0.2 s).
 # Compiled in an Alpine container on mdock (the guest's release). The object tree stays in the Docker
 # volume mdock-kernel-build, so after a patch change only what it touches is rebuilt. Output in out/:
 #   Image (raw arm64 kernel), modules.tar.gz, config, release. Install: mdock kernel install.
@@ -35,10 +37,14 @@ docker run --rm --platform linux/arm64 -v "$PWD":/k -v mdock-kernel-build:/build
   mkdir -p /build/obj
   cp /k/config-6.18-virt /tmp/config
   ./scripts/config --file /tmp/config --set-str LOCALVERSION -mdock --disable LOCALVERSION_AUTO \
-    --set-str MODULE_SIG_KEY certs/signing_key.pem --enable ARM64_MEMORY_MODEL_CONTROL
+    --set-str MODULE_SIG_KEY certs/signing_key.pem --enable ARM64_MEMORY_MODEL_CONTROL \
+    --enable VIRTIO_BLK --enable EXT4_FS --enable VIRTIO_MMIO --enable VIRTIO_NET --enable VSOCKETS \
+    --enable VIRTIO_VSOCKETS --enable VIRTIO_BALLOON --enable HW_RANDOM --enable HW_RANDOM_VIRTIO --enable FUSE_FS \
+    --enable VIRTIO_FS
   cmp -s /tmp/config /build/obj/.config.mdock 2>/dev/null || { cp /tmp/config /build/obj/.config; cp /tmp/config /build/obj/.config.mdock; }
   make -s O=/build/obj olddefconfig
   grep -q '^CONFIG_ARM64_MEMORY_MODEL_CONTROL=y' /build/obj/.config
+  grep -q '^CONFIG_VIRTIO_BLK=y' /build/obj/.config && grep -q '^CONFIG_EXT4_FS=y' /build/obj/.config
   make -s O=/build/obj -j\$(nproc) Image modules
   rm -rf /tmp/mods && make -s O=/build/obj modules_install INSTALL_MOD_PATH=/tmp/mods INSTALL_MOD_STRIP=1
   release=\$(make -s O=/build/obj kernelrelease)
