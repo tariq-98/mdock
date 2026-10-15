@@ -177,6 +177,7 @@ final class Daemon: NSObject, VZVirtualMachineDelegate, VZVirtioSocketListenerDe
     // MARK: Lifecycle
 
     func run() throws {
+        let launched = DispatchTime.now().uptimeNanoseconds
         signal(SIGPIPE, SIG_IGN)
         raiseDescriptorLimit()
         // One daemon at a time: a second one (say launchd's RunAtLoad while a `mdock start` daemon
@@ -199,9 +200,14 @@ final class Daemon: NSObject, VZVirtualMachineDelegate, VZVirtioSocketListenerDe
         do { try extractKernel() } catch { log("kernel refresh skipped: \(error)") }
         do { try Workspace.mount(quiet: true) } catch { log("workspace not mounted: \(error)") }
         // Accelerator services a previous daemon left behind when it died abruptly (reparented to
-        // launchd, still holding memory and sockets).
-        for name in Accel.services.compactMap(\.binary) {
-            _ = try? mdock.run("/usr/bin/pkill", ["-P", "1", "-f", "/\(name) serve "], quiet: true)
+        // launchd, still holding memory and sockets): one pkill, off the critical path (a pkill per
+        // service, in turn, held up every start and wake by 0.4 s). This daemon's own services are
+        // its children and only start once the guest is up, so they never match.
+        let names = Set(Accel.services.compactMap(\.binary)).sorted()
+        if !names.isEmpty {
+            Thread.detachNewThread {
+                _ = try? mdock.run("/usr/bin/pkill", ["-P", "1", "-f", "/(\(names.joined(separator: "|"))) serve "], quiet: true)
+            }
         }
         Sync.resume()
         try "\(getpid())\n".write(to: Paths.pid, atomically: true, encoding: .utf8)
@@ -235,7 +241,8 @@ final class Daemon: NSObject, VZVirtualMachineDelegate, VZVirtioSocketListenerDe
                     log("VM failed to start: \(error)")
                     self.cleanupAndExit(1)
                 }
-                log("VM started: \(self.config.cpus) vCPUs, \(self.config.memoryGiB) GiB")
+                log(String(format: "VM started: %d vCPUs, %d GiB, %.2f s after mdock launched", self.config.cpus, self.config.memoryGiB,
+                           Double(DispatchTime.now().uptimeNanoseconds - launched) / 1e9))
             }
         }
         startContainerWatcher()

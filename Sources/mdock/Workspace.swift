@@ -16,8 +16,13 @@ enum Workspace {
     static let settingsURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config/mdock/workspace.json")
     static var settings: Settings? { (try? Data(contentsOf: settingsURL)).flatMap { try? JSONDecoder().decode(Settings.self, from: $0) } }
     static func mountpoint(_ s: Settings) -> String { "/Volumes/\(s.name)" }
+    /// The volume is mounted there: a statfs, not a run of mount(8) (70 ms of every start).
     static func isMounted(_ s: Settings) -> Bool {
-        (try? run("/sbin/mount", [], quiet: true))?.contains(" on \(mountpoint(s)) (apfs") == true
+        var info = statfs()
+        guard statfs(mountpoint(s), &info) == 0 else { return false }
+        let on = withUnsafeBytes(of: info.f_mntonname) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
+        let type = withUnsafeBytes(of: info.f_fstypename) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
+        return on == mountpoint(s) && type == "apfs"
     }
 
     static func command(_ args: [String]) throws {
